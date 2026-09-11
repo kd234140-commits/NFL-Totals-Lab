@@ -184,7 +184,7 @@ def fetch_odds(_api_key: str):
     params = {
         "apiKey": _api_key,
         "regions": "us",
-        "markets": "totals,spreads",
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "american",
     }
     r = requests.get(ODDS_URL, params=params, timeout=30)
@@ -411,36 +411,141 @@ def book_market_rows(event):
     rows = []
     if not event:
         return rows
-    for b in event.get("bookmakers", []):
-        total_market = next((m for m in b.get("markets", []) if m.get("key") == "totals"), None)
-        spread_market = next((m for m in b.get("markets", []) if m.get("key") == "spreads"), None)
-        if not total_market:
-            continue
-        over = next((o for o in total_market.get("outcomes", []) if o.get("name") == "Over"), None)
-        under = next((o for o in total_market.get("outcomes", []) if o.get("name") == "Under"), None)
-        if not over or not under:
-            continue
 
-        home_spread = None
+    home_name = event.get("home_team")
+    away_name = event.get("away_team")
+
+    for b in event.get("bookmakers", []):
+        markets = b.get("markets", [])
+        total_market = next((m for m in markets if m.get("key") == "totals"), None)
+        spread_market = next((m for m in markets if m.get("key") == "spreads"), None)
+        h2h_market = next((m for m in markets if m.get("key") == "h2h"), None)
+
+        over = under = None
+        if total_market:
+            over = next((o for o in total_market.get("outcomes", []) if o.get("name") == "Over"), None)
+            under = next((o for o in total_market.get("outcomes", []) if o.get("name") == "Under"), None)
+
+        home_spread_out = away_spread_out = None
         if spread_market:
-            home_name = event.get("home_team")
-            home_out = next((o for o in spread_market.get("outcomes", []) if o.get("name") == home_name), None)
-            if home_out:
-                home_spread = to_float(home_out.get("point"))
+            home_spread_out = next(
+                (o for o in spread_market.get("outcomes", []) if o.get("name") == home_name), None
+            )
+            away_spread_out = next(
+                (o for o in spread_market.get("outcomes", []) if o.get("name") == away_name), None
+            )
+
+        home_ml_out = away_ml_out = None
+        if h2h_market:
+            home_ml_out = next(
+                (o for o in h2h_market.get("outcomes", []) if o.get("name") == home_name), None
+            )
+            away_ml_out = next(
+                (o for o in h2h_market.get("outcomes", []) if o.get("name") == away_name), None
+            )
+
+        # Keep any bookmaker that has at least one of our three core markets.
+        if not any([total_market, spread_market, h2h_market]):
+            continue
 
         rows.append({
             "key": b.get("key"),
             "book": b.get("title", b.get("key")),
-            "total": to_float(over.get("point")),
-            "over": to_float(over.get("price")),
-            "under": to_float(under.get("price")),
-            "home_spread": home_spread,
+            "total": to_float(over.get("point")) if over else None,
+            "over": to_float(over.get("price")) if over else None,
+            "under": to_float(under.get("price")) if under else None,
+            "home_spread": to_float(home_spread_out.get("point")) if home_spread_out else None,
+            "away_spread": to_float(away_spread_out.get("point")) if away_spread_out else None,
+            "home_spread_odds": to_float(home_spread_out.get("price")) if home_spread_out else None,
+            "away_spread_odds": to_float(away_spread_out.get("price")) if away_spread_out else None,
+            "home_ml": to_float(home_ml_out.get("price")) if home_ml_out else None,
+            "away_ml": to_float(away_ml_out.get("price")) if away_ml_out else None,
             "updated": b.get("last_update"),
         })
     return rows
 
 def american_profit(odds):
     return odds / 100.0 if odds > 0 else 100.0 / abs(odds)
+
+def implied_prob_american(odds):
+    if odds is None:
+        return None
+    odds = float(odds)
+    if odds == 0:
+        return None
+    if odds > 0:
+        return 100.0 / (odds + 100.0)
+    return abs(odds) / (abs(odds) + 100.0)
+
+def devig_pair(odds_a, odds_b):
+    pa = implied_prob_american(odds_a)
+    pb = implied_prob_american(odds_b)
+    if pa is None or pb is None or (pa + pb) <= 0:
+        return None, None
+    total = pa + pb
+    return pa / total, pb / total
+
+def ev_from_prob(prob, odds):
+    if prob is None or odds is None:
+        return None
+    return prob * american_profit(float(odds)) - (1.0 - prob)
+
+def consensus_moneyline(rows, selected_key=None):
+    usable = [
+        r for r in rows
+        if r.get("home_ml") is not None and r.get("away_ml") is not None
+        and r.get("key") != selected_key
+    ]
+    used_selected = False
+    if not usable:
+        usable = [
+            r for r in rows
+            if r.get("home_ml") is not None and r.get("away_ml") is not None
+        ]
+        used_selected = True
+
+    probs = []
+    for r in usable:
+        ph, pa = devig_pair(r["home_ml"], r["away_ml"])
+        if ph is not None:
+            probs.append((ph, pa))
+
+    if not probs:
+        return None, None, 0, used_selected
+
+    home_p = sum(x[0] for x in probs) / len(probs)
+    away_p = 1.0 - home_p
+    return home_p, away_p, len(probs), used_selected
+
+def consensus_spread(rows, target_home_spread, selected_key=None):
+    def same_line(r):
+        x = r.get("home_spread")
+        return (
+            x is not None
+            and target_home_spread is not None
+            and abs(float(x) - float(target_home_spread)) < 0.01
+            and r.get("home_spread_odds") is not None
+            and r.get("away_spread_odds") is not None
+        )
+
+    usable = [r for r in rows if same_line(r) and r.get("key") != selected_key]
+    used_selected = False
+    if not usable:
+        usable = [r for r in rows if same_line(r)]
+        used_selected = True
+
+    probs = []
+    for r in usable:
+        ph, pa = devig_pair(r["home_spread_odds"], r["away_spread_odds"])
+        if ph is not None:
+            probs.append((ph, pa))
+
+    if not probs:
+        return None, None, 0, used_selected
+
+    home_p = sum(x[0] for x in probs) / len(probs)
+    away_p = 1.0 - home_p
+    return home_p, away_p, len(probs), used_selected
 
 def fair_american(p):
     if not (0 < p < 1):
@@ -584,7 +689,12 @@ if book_rows:
     market_source = book_name
 
     with st.expander("Compare available sportsbook totals"):
-        show = books_df[["book", "total", "over", "under", "home_spread", "updated"]].copy()
+        show_cols = [
+            "book", "total", "over", "under",
+            "home_spread", "home_spread_odds", "away_spread_odds",
+            "home_ml", "away_ml", "updated"
+        ]
+        show = books_df[[c for c in show_cols if c in books_df.columns]].copy()
         st.dataframe(show, use_container_width=True, hide_index=True)
 
 fallback_total = to_float(game.get("total_line"), 44.5)
@@ -606,6 +716,46 @@ over_odds = m2.number_input("Over odds", value=int(round(default_over)), step=1)
 under_odds = m3.number_input("Under odds", value=int(round(default_under)), step=1)
 home_spread = m4.number_input("Home spread", value=float(default_spread), step=0.5)
 st.caption(f"Market source: **{market_source}**. You can always overwrite the line or price before calculating.")
+
+# Current spread and moneyline prices from the selected sportsbook.
+if selected_book_row:
+    default_home_spread_odds = selected_book_row.get("home_spread_odds")
+    default_away_spread_odds = selected_book_row.get("away_spread_odds")
+    default_home_ml = selected_book_row.get("home_ml")
+    default_away_ml = selected_book_row.get("away_ml")
+else:
+    default_home_spread_odds = None
+    default_away_spread_odds = None
+    default_home_ml = None
+    default_away_ml = None
+
+st.markdown("##### Spread & moneyline prices")
+s1, s2, s3 = st.columns(3)
+home_spread_odds = s1.number_input(
+    f"{home} {home_spread:+.1f} odds",
+    value=int(round(default_home_spread_odds if default_home_spread_odds is not None else -110)),
+    step=1,
+)
+away_spread_odds = s2.number_input(
+    f"{away} {-home_spread:+.1f} odds",
+    value=int(round(default_away_spread_odds if default_away_spread_odds is not None else -110)),
+    step=1,
+)
+home_ml = s3.number_input(
+    f"{home} moneyline",
+    value=int(round(default_home_ml if default_home_ml is not None else -110)),
+    step=1,
+)
+
+s4, s5, s6 = st.columns(3)
+away_ml = s4.number_input(
+    f"{away} moneyline",
+    value=int(round(default_away_ml if default_away_ml is not None else -110)),
+    step=1,
+)
+s5.metric("Away spread", f"{-home_spread:+.1f}")
+s6.caption("These prices update from the selected sportsbook when available.")
+
 
 # -----------------------------
 # Weather + roof
@@ -786,6 +936,84 @@ if result["signal"] != "PASS":
 else:
     st.info("V1 filter says PASS.")
 
+# -----------------------------
+# Spread & Moneyline EV
+# -----------------------------
+st.subheader("Spread & Moneyline EV")
+
+selected_key = selected_book_row.get("key") if selected_book_row else None
+
+ml_home_p, ml_away_p, ml_books, ml_used_selected = consensus_moneyline(
+    book_rows, selected_key=selected_key
+)
+sp_home_p, sp_away_p, sp_books, sp_used_selected = consensus_spread(
+    book_rows, float(home_spread), selected_key=selected_key
+)
+
+if book_rows and ml_home_p is not None:
+    home_ml_ev = ev_from_prob(ml_home_p, float(home_ml))
+    away_ml_ev = ev_from_prob(ml_away_p, float(away_ml))
+
+    st.markdown("##### Moneyline")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} fair win probability", f"{ml_home_p:.1%}")
+    b.metric(f"{home} ML EV", f"{home_ml_ev:+.1%}")
+    c.metric(f"{away} fair win probability", f"{ml_away_p:.1%}")
+    d.metric(f"{away} ML EV", f"{away_ml_ev:+.1%}")
+
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} fair ML", fmt_odds(fair_american(ml_home_p)))
+    b.metric(f"{home} offered ML", fmt_odds(home_ml))
+    c.metric(f"{away} fair ML", fmt_odds(fair_american(ml_away_p)))
+    d.metric(f"{away} offered ML", fmt_odds(away_ml))
+
+    ml_note = (
+        f"Fair moneyline probability is the average de-vigged probability from "
+        f"{ml_books} {'other sportsbook' if ml_books == 1 else 'other sportsbooks'}."
+    )
+    if ml_used_selected:
+        ml_note += " No other-book pair was available, so the selected book was used."
+    st.caption(ml_note)
+else:
+    st.info("Moneyline EV needs live h2h prices from The Odds API.")
+
+if book_rows and sp_home_p is not None:
+    home_spread_ev = ev_from_prob(sp_home_p, float(home_spread_odds))
+    away_spread_ev = ev_from_prob(sp_away_p, float(away_spread_odds))
+
+    st.markdown("##### Point spread")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} {home_spread:+.1f} fair cover %", f"{sp_home_p:.1%}")
+    b.metric(f"{home} spread EV", f"{home_spread_ev:+.1%}")
+    c.metric(f"{away} {-home_spread:+.1f} fair cover %", f"{sp_away_p:.1%}")
+    d.metric(f"{away} spread EV", f"{away_spread_ev:+.1%}")
+
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} fair spread odds", fmt_odds(fair_american(sp_home_p)))
+    b.metric(f"{home} offered odds", fmt_odds(home_spread_odds))
+    c.metric(f"{away} fair spread odds", fmt_odds(fair_american(sp_away_p)))
+    d.metric(f"{away} offered odds", fmt_odds(away_spread_odds))
+
+    spread_note = (
+        f"Spread consensus uses {sp_books} "
+        f"{'sportsbook' if sp_books == 1 else 'sportsbooks'} posting the same "
+        f"{home} {home_spread:+.1f} line."
+    )
+    if sp_used_selected:
+        spread_note += " Other books at the exact same spread were unavailable, so the selected book was included."
+    st.caption(spread_note)
+else:
+    st.info(
+        f"No consensus was available for the exact {home} {home_spread:+.1f} spread. "
+        "This can happen when other books are hanging a different number."
+    )
+
+st.caption(
+    "Spread and moneyline EV here are **market-consensus EV**, not V1 model EV. "
+    "The app removes the vig from sportsbook prices and compares the selected book's price "
+    "with the consensus fair probability. A predictive side model would be a separate Version 2 project."
+)
+
 st.divider()
 with st.expander("Data sources & refresh behavior"):
     st.markdown(
@@ -793,7 +1021,7 @@ with st.expander("Data sources & refresh behavior"):
 - **Schedule / game metadata:** nflverse `games.csv`
 - **Team EPA / success / explosive / play volume / turnovers / sacks:** calculated from nflverse play-by-play
 - **Weather:** Open-Meteo stadium-area forecast
-- **Sportsbook totals / prices:** The Odds API when a key is configured
+- **Sportsbook totals / spreads / moneylines / prices:** The Odds API when a key is configured
 - **Fallback line:** nflverse schedule snapshot or manual override
 - Schedule refresh cache: ~30 minutes
 - Weather refresh cache: ~30 minutes
