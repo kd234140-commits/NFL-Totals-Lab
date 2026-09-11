@@ -24,7 +24,6 @@ ROOT = Path(__file__).resolve().parent
 SCHEDULE_URL = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
 PBP_URL = "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{season}.csv.gz"
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
-GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
 # nflverse uses LA for the Rams.
@@ -64,40 +63,41 @@ ODDS_NAME_TO_ABBR = {
 }
 ABBR_TO_ODDS_NAME = {v: k for k, v in ODDS_NAME_TO_ABBR.items()}
 
-# Use stadium-area cities for weather. Open-Meteo geocodes these at runtime.
-WEATHER_QUERY = {
-    "ARI": "Glendale Arizona",
-    "ATL": "Atlanta Georgia",
-    "BAL": "Baltimore Maryland",
-    "BUF": "Orchard Park New York",
-    "CAR": "Charlotte North Carolina",
-    "CHI": "Chicago Illinois",
-    "CIN": "Cincinnati Ohio",
-    "CLE": "Cleveland Ohio",
-    "DAL": "Arlington Texas",
-    "DEN": "Denver Colorado",
-    "DET": "Detroit Michigan",
-    "GB": "Green Bay Wisconsin",
-    "HOU": "Houston Texas",
-    "IND": "Indianapolis Indiana",
-    "JAX": "Jacksonville Florida",
-    "KC": "Kansas City Missouri",
-    "LV": "Las Vegas Nevada",
-    "LAC": "Inglewood California",
-    "LA": "Inglewood California",
-    "MIA": "Miami Gardens Florida",
-    "MIN": "Minneapolis Minnesota",
-    "NE": "Foxborough Massachusetts",
-    "NO": "New Orleans Louisiana",
-    "NYG": "East Rutherford New Jersey",
-    "NYJ": "East Rutherford New Jersey",
-    "PHI": "Philadelphia Pennsylvania",
-    "PIT": "Pittsburgh Pennsylvania",
-    "SEA": "Seattle Washington",
-    "SF": "Santa Clara California",
-    "TB": "Tampa Florida",
-    "TEN": "Nashville Tennessee",
-    "WAS": "Landover Maryland",
+# Stadium-area coordinates used directly for weather.
+# This avoids city-name geocoding failures and ties the forecast to the venue area.
+WEATHER_COORDS = {
+    "ARI": (33.5276, -112.2626, "State Farm Stadium"),
+    "ATL": (33.7554, -84.4008, "Mercedes-Benz Stadium"),
+    "BAL": (39.2780, -76.6227, "M&T Bank Stadium"),
+    "BUF": (42.7738, -78.7868, "Highmark Stadium"),
+    "CAR": (35.2258, -80.8528, "Bank of America Stadium"),
+    "CHI": (41.8623, -87.6167, "Soldier Field"),
+    "CIN": (39.0955, -84.5161, "Paycor Stadium"),
+    "CLE": (41.5061, -81.6995, "Huntington Bank Field"),
+    "DAL": (32.7473, -97.0945, "AT&T Stadium"),
+    "DEN": (39.7439, -105.0201, "Empower Field at Mile High"),
+    "DET": (42.3400, -83.0456, "Ford Field"),
+    "GB": (44.5013, -88.0622, "Lambeau Field"),
+    "HOU": (29.6847, -95.4107, "NRG Stadium"),
+    "IND": (39.7601, -86.1639, "Lucas Oil Stadium"),
+    "JAX": (30.3239, -81.6373, "EverBank Stadium"),
+    "KC": (39.0489, -94.4839, "Arrowhead Stadium"),
+    "LV": (36.0908, -115.1830, "Allegiant Stadium"),
+    "LAC": (33.9535, -118.3392, "SoFi Stadium"),
+    "LA": (33.9535, -118.3392, "SoFi Stadium"),
+    "MIA": (25.9580, -80.2389, "Hard Rock Stadium"),
+    "MIN": (44.9738, -93.2581, "U.S. Bank Stadium"),
+    "NE": (42.0909, -71.2643, "Gillette Stadium"),
+    "NO": (29.9511, -90.0812, "Caesars Superdome"),
+    "NYG": (40.8135, -74.0745, "MetLife Stadium"),
+    "NYJ": (40.8135, -74.0745, "MetLife Stadium"),
+    "PHI": (39.9008, -75.1675, "Lincoln Financial Field"),
+    "PIT": (40.4468, -80.0158, "Acrisure Stadium"),
+    "SEA": (47.5952, -122.3316, "Lumen Field"),
+    "SF": (37.4030, -121.9700, "Levi's Stadium"),
+    "TB": (27.9759, -82.5033, "Raymond James Stadium"),
+    "TEN": (36.1665, -86.7713, "Nissan Stadium"),
+    "WAS": (38.9076, -76.8645, "Northwest Stadium"),
 }
 
 # Roof classification. Retractable-roof games still need a game-day open/closed choice.
@@ -195,23 +195,8 @@ def fetch_odds(_api_key: str):
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def geocode(query: str):
-    r = requests.get(
-        GEO_URL,
-        params={"name": query, "count": 1, "language": "en", "format": "json"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    results = r.json().get("results") or []
-    if not results:
-        raise RuntimeError(f"Could not geocode {query}.")
-    x = results[0]
-    return float(x["latitude"]), float(x["longitude"]), x.get("timezone", "America/New_York"), x.get("name", query)
-
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_weather(query: str, kickoff_utc_iso: str):
-    lat, lon, tz_name, resolved_name = geocode(query)
+def fetch_weather(lat: float, lon: float, venue_name: str, kickoff_utc_iso: str):
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -224,19 +209,20 @@ def fetch_weather(query: str, kickoff_utc_iso: str):
     r = requests.get(WEATHER_URL, params=params, timeout=30)
     r.raise_for_status()
     payload = r.json()
-    tz_name = payload.get("timezone") or tz_name
+
+    tz_name = payload.get("timezone") or "America/New_York"
     kickoff_utc = datetime.fromisoformat(kickoff_utc_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
     local_dt = kickoff_utc.astimezone(ZoneInfo(tz_name))
     target = local_dt.replace(minute=0, second=0, microsecond=0)
 
     hourly = pd.DataFrame(payload["hourly"])
     hourly["time"] = pd.to_datetime(hourly["time"])
-    # API times are local clock values because timezone=auto.
     naive_target = target.replace(tzinfo=None)
     idx = (hourly["time"] - pd.Timestamp(naive_target)).abs().idxmin()
     row = hourly.loc[idx]
+
     return {
-        "resolved_name": resolved_name,
+        "resolved_name": venue_name,
         "timezone": tz_name,
         "kickoff_local": local_dt,
         "temperature": float(row["temperature_2m"]),
@@ -506,12 +492,6 @@ def fmt_odds(x):
 st.title("🏈 NFL Totals Lab — Auto Data")
 st.caption("Schedule + team metrics + weather load automatically. Live sportsbook odds can load automatically with The Odds API.")
 
-st.error(
-    f"**V1 is research-only:** the untouched {int(HOLDOUT['Holdout_Season'])} test went "
-    f"{int(HOLDOUT['Wins'])}-{int(HOLDOUT['Losses'])}, "
-    f"{float(HOLDOUT['Win_Pct']):.1%} wins and {float(HOLDOUT['ROI']):.1%} ROI. "
-    "This app automates the data workflow; it does not turn V1 into a proven betting edge."
-)
 
 with st.sidebar:
     st.header("Live data settings")
@@ -633,12 +613,13 @@ st.caption(f"Market source: **{market_source}**. You can always overwrite the li
 st.subheader("Weather")
 weather = None
 weather_error = None
-query = WEATHER_QUERY.get(home)
+weather_loc = WEATHER_COORDS.get(home)
 
 try:
-    if query:
+    if weather_loc:
+        lat, lon, venue_name = weather_loc
         with st.spinner("Loading stadium-area forecast…"):
-            weather = fetch_weather(query, kickoff_utc.isoformat())
+            weather = fetch_weather(lat, lon, venue_name, kickoff_utc.isoformat())
 except Exception as exc:
     weather_error = str(exc)
 
@@ -821,6 +802,9 @@ with st.expander("Data sources & refresh behavior"):
         """
     )
 
-st.caption(
-    "This app is for model research and line comparison. The current V1 model did not show a profitable out-of-sample edge."
-)
+with st.expander("Model status"):
+    st.caption(
+        f"V1 historical holdout: {int(HOLDOUT['Wins'])}-{int(HOLDOUT['Losses'])}, "
+        f"{float(HOLDOUT['Win_Pct']):.1%} wins, {float(HOLDOUT['ROI']):.1%} ROI."
+    )
+
