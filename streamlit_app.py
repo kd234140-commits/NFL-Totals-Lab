@@ -12,12 +12,18 @@ import requests
 import streamlit as st
 
 try:
-    from v2_side_live import build_side_prediction, build_side_prediction_v23
-    V2_SIDE_IMPORT_ERROR = None
-except Exception as _v2_exc:
+    from v2_side_live import build_side_prediction
+    V22_SIDE_IMPORT_ERROR = None
+except Exception as _v22_exc:
     build_side_prediction = None
+    V22_SIDE_IMPORT_ERROR = str(_v22_exc)
+
+try:
+    from v2_side_live_v23 import build_side_prediction_v23
+    V23_SIDE_IMPORT_ERROR = None
+except Exception as _v23_exc:
     build_side_prediction_v23 = None
-    V2_SIDE_IMPORT_ERROR = str(_v2_exc)
+    V23_SIDE_IMPORT_ERROR = str(_v23_exc)
 
 # -----------------------------
 # App configuration
@@ -958,7 +964,7 @@ st.caption(
 v23_result = None
 v23_error = None
 if build_side_prediction_v23 is None:
-    v23_error = f"V2.3 module could not load: {V2_SIDE_IMPORT_ERROR}"
+    v23_error = f"V2.3 module could not load: {V23_SIDE_IMPORT_ERROR}"
 else:
     try:
         with st.spinner("Loading current injuries and running V2.3 challenger…"):
@@ -1070,7 +1076,7 @@ st.caption(
 v2_result = None
 v2_error = None
 if build_side_prediction is None:
-    v2_error = f"V2.2 module could not load: {V2_SIDE_IMPORT_ERROR}"
+    v2_error = f"V2.2 module could not load: {V22_SIDE_IMPORT_ERROR}"
 else:
     try:
         with st.spinner("Building V2.2 live side features and running the frozen model…"):
