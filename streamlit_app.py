@@ -1064,6 +1064,13 @@ if v23_result:
                 rows.append({"Team": tm, "NFL.com": vals.get("official",0), "ESPN": vals.get("espn",0), "Sleeper": vals.get("sleeper",0), "Merged players": vals.get("merged",0)})
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
+        moved = imeta.get("official_team_reassignments", []) or []
+        if moved:
+            st.warning(
+                f"Safety check repaired {len(moved)} NFL.com player/team assignments after cross-checking the current Sleeper roster. "
+                "This prevents a scraped table from being attached to the wrong team."
+            )
+
         player_map = imeta.get("players", {}) or {}
         injury_rows=[]
         for tm in [home, away]:

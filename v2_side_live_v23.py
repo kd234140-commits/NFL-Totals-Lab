@@ -647,9 +647,62 @@ def build_depth_features(season:int, game_date, home:str, away:str):
 
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sleeper_players_all():
+    """Raw Sleeper NFL player dictionary. Free, no API key."""
+    try:
+        r = requests.get(
+            SLEEPER_PLAYERS_URL,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 NFL-Betting-Lab/1.0"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _team_alias_map():
+    aliases = {}
+    for abbr, full in TEAM_FULL.items():
+        vals = {abbr.upper(), full.upper(), full.split()[-1].upper()}
+        # NFL often uses AZ in display copy while our canonical abbreviation is ARI.
+        if abbr == "ARI":
+            vals.add("AZ")
+        if abbr == "LA":
+            vals.update({"LAR", "RAMS"})
+        for v in vals:
+            aliases[re.sub(r"\\s+", " ", v.strip())] = abbr
+    return aliases
+
+
+TEAM_ALIASES = _team_alias_map()
+
+
+def _team_from_injury_table_context(table):
+    """Find the injury-table team heading, not the matchup-strip home-team link.
+
+    NFL.com's page shows a matchup strip containing both team names, then a separate
+    team label immediately before each injury table.  The old parser used the last
+    matchup-strip team link, which can assign BOTH tables to the home team.
+    """
+    # Look backward for a nearby standalone heading/label that exactly names a team.
+    # Explicitly ignore matchup-strip descendants; those contain both teams and are
+    # the source of the previous mis-attribution bug.
+    for el in table.find_all_previous(["h2", "h3", "h4", "h5", "h6", "p", "div", "span", "a"], limit=120):
+        classes = " ".join(el.get("class", []) if hasattr(el, "get") else [])
+        if "matchup-strip" in classes:
+            continue
+        txt = re.sub(r"\\s+", " ", el.get_text(" ", strip=True).upper()).strip()
+        if txt in TEAM_ALIASES:
+            return TEAM_ALIASES[txt]
+    return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_nfl_official_injuries():
-    """Scrape the official NFL.com weekly injury report. Free, no API key."""
+    """Scrape NFL.com's official weekly injury report. Free, no API key."""
     try:
         r = requests.get(
             NFL_INJURIES_URL,
@@ -664,17 +717,7 @@ def load_nfl_official_injuries():
         by_team = {}
         tables = soup.find_all("table", class_="d3-o-table")
         for table in tables:
-            team_link = table.find_previous("a", class_="nfl-c-matchup-strip__team-fullname")
-            if not team_link:
-                continue
-            raw_team = team_link.get_text(" ", strip=True).upper()
-            team = FULL_TO_TEAM.get(raw_team)
-            if not team:
-                # tolerate strings such as "Pittsburgh Steelers"
-                for name, abbr in FULL_TO_TEAM.items():
-                    if name in raw_team or raw_team in name:
-                        team = abbr
-                        break
+            team = _team_from_injury_table_context(table)
             if not team:
                 continue
             rows = []
@@ -692,8 +735,11 @@ def load_nfl_official_injuries():
                 status = cells[4].get_text(" ", strip=True)
                 if player:
                     rows.append({
-                        "player": player, "position": pos, "injury": injury,
-                        "practice": practice, "status": status,
+                        "player": player,
+                        "position": pos,
+                        "injury": injury,
+                        "practice": practice,
+                        "status": status,
                         "source": "NFL.com official",
                     })
             if rows:
@@ -703,184 +749,277 @@ def load_nfl_official_injuries():
         return {}
 
 
+def _stringish(v):
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        # Common ESPN shapes for status/detail objects.
+        for k in ["description", "detail", "name", "abbreviation", "shortName", "text", "type"]:
+            if v.get(k):
+                return str(v.get(k))
+        return ""
+    if isinstance(v, list):
+        vals = [_stringish(x) for x in v]
+        return ", ".join(x for x in vals if x)
+    return str(v)
+
+
+def _parse_espn_injury_item(item):
+    if not isinstance(item, dict):
+        return None
+    ath = item.get("athlete") or {}
+    pos = (ath.get("position") or {}).get("abbreviation") or item.get("position") or ""
+    status = _stringish(item.get("status") or item.get("type") or item.get("gameStatus"))
+    practice = _stringish(item.get("practiceStatus") or item.get("practice") or item.get("practiceType"))
+    injury = _stringish(item.get("details") or item.get("shortComment") or item.get("injury") or item.get("bodyPart"))
+    player = ath.get("fullName") or ath.get("displayName") or item.get("name") or item.get("displayName") or ""
+    if not player:
+        return None
+    return {
+        "player": player,
+        "position": pos,
+        "injury": injury,
+        "practice": practice,
+        "status": status,
+        "source": "ESPN",
+    }
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def load_espn_team_injuries(team: str):
-    """ESPN public team injury endpoint; used as a free fallback/supplement."""
-    tid = ESPN_TEAM_ID.get(norm_team(team))
-    if not tid:
-        return []
-    urls = [
-        f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}/injuries",
-        ESPN_INJURIES_URL,
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0 NFL-Betting-Lab/1.0"})
-            r.raise_for_status()
-            data = r.json()
-            rows=[]
-            injuries = data.get("injuries", []) if isinstance(data, dict) else []
-            # Team endpoint: injuries is player objects. League endpoint: team-group objects.
-            if injuries and isinstance(injuries[0], dict) and "athlete" in injuries[0]:
-                items = injuries
-            else:
-                items=[]
-                for grp in injuries if isinstance(injuries, list) else []:
-                    if not isinstance(grp, dict):
-                        continue
-                    gt = norm_team((grp.get("team") or {}).get("abbreviation"))
-                    if gt == norm_team(team):
-                        items.extend(grp.get("injuries", []) or [])
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                ath=item.get("athlete") or {}
-                pos=(ath.get("position") or {}).get("abbreviation") or item.get("position") or ""
-                status=item.get("status") or item.get("type") or ""
-                if isinstance(status, dict):
-                    status=status.get("description") or status.get("name") or status.get("abbreviation") or ""
-                rows.append({
-                    "player": ath.get("fullName") or ath.get("displayName") or item.get("name") or "",
-                    "position": pos,
-                    "injury": item.get("details") or item.get("shortComment") or "",
-                    "practice": item.get("practiceStatus") or "",
-                    "status": str(status),
-                    "source": "ESPN",
-                })
-            if rows:
-                return rows
-        except Exception:
-            continue
-    return []
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_sleeper_injuries():
-    """Sleeper's public player feed includes team, position and injury_status."""
+def load_espn_all_injuries():
+    """League-wide ESPN public injury feed, grouped by team. Free/no auth."""
     try:
-        r=requests.get(SLEEPER_PLAYERS_URL, timeout=15, headers={"User-Agent":"Mozilla/5.0 NFL-Betting-Lab/1.0"})
+        r = requests.get(
+            ESPN_INJURIES_URL,
+            timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 NFL-Betting-Lab/1.0"},
+        )
         r.raise_for_status()
-        data=r.json()
-        by_team={}
-        if not isinstance(data, dict):
-            return {}
-        for p in data.values():
-            if not isinstance(p, dict):
+        data = r.json()
+        by_team = {}
+        for grp in data.get("injuries", []) if isinstance(data, dict) else []:
+            if not isinstance(grp, dict):
                 continue
-            team=norm_team(p.get("team"))
-            status=str(p.get("injury_status") or "").strip()
-            practice=str(p.get("practice_participation") or "").strip()
-            if not team or (not status and not practice):
-                continue
-            name=p.get("full_name") or " ".join(x for x in [p.get("first_name"),p.get("last_name")] if x) or ""
-            by_team.setdefault(team,[]).append({
-                "player":name,
-                "position":p.get("position") or "",
-                "injury":p.get("injury_body_part") or p.get("injury_notes") or "",
-                "practice":practice,
-                "status":status,
-                "source":"Sleeper",
-            })
+            t = grp.get("team") or {}
+            team = norm_team(t.get("abbreviation") or t.get("shortDisplayName") or t.get("name"))
+            if team not in TEAM_FULL:
+                # If ESPN gives a full team name, normalize it here.
+                team = TEAM_ALIASES.get(str(t.get("displayName") or "").upper(), team)
+            rows = []
+            for item in grp.get("injuries", []) or []:
+                rr = _parse_espn_injury_item(item)
+                if rr:
+                    rows.append(rr)
+            if team in TEAM_FULL and rows:
+                by_team.setdefault(team, []).extend(rows)
         return by_team
     except Exception:
         return {}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_espn_team_injuries(team: str):
+    """ESPN public injury data. League feed first; team endpoint fallback."""
+    team = norm_team(team)
+    all_rows = load_espn_all_injuries()
+    if isinstance(all_rows, dict) and all_rows.get(team):
+        return all_rows.get(team, [])
+
+    tid = ESPN_TEAM_ID.get(team)
+    if not tid:
+        return []
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}/injuries"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0 NFL-Betting-Lab/1.0"})
+        r.raise_for_status()
+        data = r.json()
+        injuries = data.get("injuries", []) if isinstance(data, dict) else []
+        items = []
+        if injuries and isinstance(injuries[0], dict) and "athlete" in injuries[0]:
+            items = injuries
+        else:
+            for grp in injuries if isinstance(injuries, list) else []:
+                if isinstance(grp, dict):
+                    items.extend(grp.get("injuries", []) or [])
+        rows = []
+        for item in items:
+            rr = _parse_espn_injury_item(item)
+            if rr:
+                rows.append(rr)
+        return rows
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sleeper_injuries():
+    """Sleeper's public player feed includes team, position and injury status."""
+    data = load_sleeper_players_all()
+    by_team = {}
+    for p in data.values() if isinstance(data, dict) else []:
+        if not isinstance(p, dict):
+            continue
+        team = norm_team(p.get("team"))
+        status = str(p.get("injury_status") or "").strip()
+        practice = str(p.get("practice_participation") or "").strip()
+        if team not in TEAM_FULL or (not status and not practice):
+            continue
+        name = p.get("full_name") or " ".join(x for x in [p.get("first_name"), p.get("last_name")] if x) or ""
+        by_team.setdefault(team, []).append({
+            "player": name,
+            "position": p.get("position") or "",
+            "injury": p.get("injury_body_part") or p.get("injury_notes") or "",
+            "practice": practice,
+            "status": status,
+            "source": "Sleeper",
+        })
+    return by_team
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sleeper_roster_map():
+    """Name -> current Sleeper team sanity map. Used only to catch parser mistakes."""
+    data = load_sleeper_players_all()
+    out = {}
+    for p in data.values() if isinstance(data, dict) else []:
+        if not isinstance(p, dict):
+            continue
+        team = norm_team(p.get("team"))
+        if team not in TEAM_FULL:
+            continue
+        name = p.get("full_name") or " ".join(x for x in [p.get("first_name"), p.get("last_name")] if x) or ""
+        k = _name_key(name)
+        if k:
+            out[k] = team
+    return out
+
+
 def _name_key(name):
-    s=unicodedata.normalize("NFKD",str(name or "")).encode("ascii","ignore").decode().lower()
-    s=re.sub(r"\b(jr|sr|ii|iii|iv)\b\.?", "", s)
+    s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"\\b(jr|sr|ii|iii|iv)\\b\\.?", "", s)
     return re.sub(r"[^a-z0-9]", "", s)
 
 
 def _status_norm(status):
-    s=str(status or "").upper().strip()
+    s = str(status or "").upper().strip()
     if "OUT" == s or "RULED OUT" in s or "INACTIVE" in s:
         return "OUT"
     if "DOUBTFUL" in s:
         return "DOUBTFUL"
-    if "QUESTIONABLE" in s or s in {"Q","QUESTION"}:
+    if "QUESTIONABLE" in s or s in {"Q", "QUESTION"}:
         return "QUESTIONABLE"
     return ""
 
 
+def _sanitize_official_team_assignments(official, roster_map):
+    """Repair/reject an NFL.com table row when roster identity contradicts table attribution.
+
+    This is a guardrail, not a source override: it only fires when the player's current
+    Sleeper roster team is known and differs from the scraped table team.
+    """
+    cleaned = {t: [] for t in TEAM_FULL}
+    moved = []
+    for parsed_team, rows in (official or {}).items():
+        parsed_team = norm_team(parsed_team)
+        for row in rows or []:
+            k = _name_key(row.get("player"))
+            roster_team = norm_team(roster_map.get(k)) if k else None
+            target = roster_team if roster_team in TEAM_FULL and roster_team != parsed_team else parsed_team
+            if target not in TEAM_FULL:
+                continue
+            rr = dict(row)
+            if target != parsed_team:
+                moved.append({"player": rr.get("player", ""), "from": parsed_team, "to": target})
+            cleaned.setdefault(target, []).append(rr)
+    return {k: v for k, v in cleaned.items() if v}, moved
+
+
 def _merge_injury_rows(team: str, official, espn, sleeper):
     """Union free sources; official NFL rows define the list when available."""
-    priority={"NFL.com official":3,"ESPN":2,"Sleeper":1}
-    severity={"":0,"QUESTIONABLE":1,"DOUBTFUL":2,"OUT":3}
-    merged={}
-    # Official first so practice-only listed players are preserved.
-    for rows in [official,espn,sleeper]:
+    priority = {"NFL.com official": 3, "ESPN": 2, "Sleeper": 1}
+    severity = {"": 0, "QUESTIONABLE": 1, "DOUBTFUL": 2, "OUT": 3}
+    merged = {}
+    for rows in [official, espn, sleeper]:
         for row in rows or []:
-            k=_name_key(row.get("player"))
+            k = _name_key(row.get("player"))
             if not k:
                 continue
-            rr=dict(row)
-            rr["status"]=_status_norm(rr.get("status"))
-            old=merged.get(k)
+            rr = dict(row)
+            rr["status"] = _status_norm(rr.get("status"))
+            old = merged.get(k)
             if old is None:
-                # ESPN/Sleeper players with no usable game status should not
-                # expand the weekly official injury list on their own.
                 if rr.get("source") != "NFL.com official" and not rr["status"]:
                     continue
-                merged[k]=rr
+                merged[k] = rr
                 continue
-            # Take the most severe explicit game status seen by any source.
-            if severity.get(rr["status"],0)>severity.get(old.get("status",""),0):
-                old["status"]=rr["status"]
-            # Prefer higher-quality source for position / context fields.
-            if priority.get(rr.get("source"),0)>priority.get(old.get("source"),0):
-                for fld in ["position","injury","practice"]:
-                    if rr.get(fld): old[fld]=rr[fld]
-            srcs=set(str(old.get("source","")).split(" + ")) | {str(rr.get("source",""))}
-            old["source"]=" + ".join(s for s in ["NFL.com official","ESPN","Sleeper"] if s in srcs)
+            if severity.get(rr["status"], 0) > severity.get(old.get("status", ""), 0):
+                old["status"] = rr["status"]
+            if priority.get(rr.get("source"), 0) > priority.get(old.get("source"), 0):
+                for fld in ["position", "injury", "practice"]:
+                    if rr.get(fld):
+                        old[fld] = rr[fld]
+            srcs = set(str(old.get("source", "")).split(" + ")) | {str(rr.get("source", ""))}
+            old["source"] = " + ".join(s for s in ["NFL.com official", "ESPN", "Sleeper"] if s in srcs)
     return list(merged.values())
 
 
 def _injury_pg(pos):
     p = str(pos or "").upper().strip()
     if p == "QB": return "QB"
-    if p in {"T","OT","G","OG","C","OL"}: return "OL"
-    if p in {"RB","FB"}: return "RB"
-    if p in {"WR","TE"}: return "WRTE"
-    if p in {"DE","DT","NT","DL","EDGE"}: return "DL"
-    if p in {"LB","ILB","OLB"}: return "LB"
-    if p in {"CB","S","FS","SS","DB"}: return "DB"
+    if p in {"T", "OT", "G", "OG", "C", "OL"}: return "OL"
+    if p in {"RB", "FB"}: return "RB"
+    if p in {"WR", "TE"}: return "WRTE"
+    if p in {"DE", "DT", "NT", "DL", "EDGE"}: return "DL"
+    if p in {"LB", "ILB", "OLB"}: return "LB"
+    if p in {"CB", "S", "FS", "SS", "DB"}: return "DB"
     return "OTHER"
 
 
 def build_free_injury_features(home: str, away: str):
-    """Best-effort free injury consensus: NFL.com -> ESPN -> Sleeper."""
-    official=load_nfl_official_injuries()
-    sleeper=load_sleeper_injuries()
-    out={};found=[]; players={}; sources_used=set(); source_detail={}
-    for side,team in [("home",home),("away",away)]:
-        off=official.get(team,[]) if isinstance(official,dict) else []
-        espn=load_espn_team_injuries(team)
-        sl=sleeper.get(team,[]) if isinstance(sleeper,dict) else []
-        rows=_merge_injury_rows(team,off,espn,sl)
-        source_detail[team]={"official":len(off),"espn":len(espn),"sleeper":len(sl),"merged":len(rows)}
+    """Best-effort free injury consensus: NFL.com + ESPN + Sleeper, with team sanity checks."""
+    official_raw = load_nfl_official_injuries()
+    roster_map = load_sleeper_roster_map()
+    official, moved = _sanitize_official_team_assignments(official_raw, roster_map)
+    sleeper = load_sleeper_injuries()
+    out = {}; found = []; players = {}; sources_used = set(); source_detail = {}
+    for side, team in [("home", home), ("away", away)]:
+        team = norm_team(team)
+        off = official.get(team, []) if isinstance(official, dict) else []
+        espn = load_espn_team_injuries(team)
+        sl = sleeper.get(team, []) if isinstance(sleeper, dict) else []
+        rows = _merge_injury_rows(team, off, espn, sl)
+        source_detail[team] = {
+            "official": len(off),
+            "espn": len(espn),
+            "sleeper": len(sl),
+            "merged": len(rows),
+        }
         if rows:
             found.append(team)
         for rr in rows:
-            for s in str(rr.get("source","")).split(" + "):
-                if s: sources_used.add(s)
-        players[team]=rows
-        vals=[(_injury_pg(r.get("position")),_status_norm(r.get("status"))) for r in rows]
-        for st in ["OUT","DOUBTFUL","QUESTIONABLE"]:
-            out[f"{side}_inj_{st.lower()}_count"]=int(sum(s==st for _,s in vals))
-        for pg in ["QB","OL","RB","WRTE","DL","LB","DB"]:
-            rr=[(g,s) for g,s in vals if g==pg]
-            out[f"{side}_inj_{pg.lower()}_listed"]=int(len(rr))
-            out[f"{side}_inj_{pg.lower()}_out"]=int(sum(s=="OUT" for _,s in rr))
-    ok=home in found and away in found
-    meta={
-        "source":" + ".join(s for s in ["NFL.com official","ESPN","Sleeper"] if s in sources_used) or "none",
-        "sources_used":[s for s in ["NFL.com official","ESPN","Sleeper"] if s in sources_used],
-        "teams_found":found,
-        "source_detail":source_detail,
-        "players":players,
+            for src in str(rr.get("source", "")).split(" + "):
+                if src:
+                    sources_used.add(src)
+        players[team] = rows
+        vals = [(_injury_pg(r.get("position")), _status_norm(r.get("status"))) for r in rows]
+        for st in ["OUT", "DOUBTFUL", "QUESTIONABLE"]:
+            out[f"{side}_inj_{st.lower()}_count"] = int(sum(s == st for _, s in vals))
+        for pg in ["QB", "OL", "RB", "WRTE", "DL", "LB", "DB"]:
+            rr = [(g, s) for g, s in vals if g == pg]
+            out[f"{side}_inj_{pg.lower()}_listed"] = int(len(rr))
+            out[f"{side}_inj_{pg.lower()}_out"] = int(sum(s == "OUT" for _, s in rr))
+    ok = norm_team(home) in found and norm_team(away) in found
+    meta = {
+        "source": " + ".join(s for s in ["NFL.com official", "ESPN", "Sleeper"] if s in sources_used) or "none",
+        "sources_used": [s for s in ["NFL.com official", "ESPN", "Sleeper"] if s in sources_used],
+        "teams_found": found,
+        "source_detail": source_detail,
+        "players": players,
+        "official_team_reassignments": moved,
     }
-    return out,ok,meta
+    return out, ok, meta
 
 
 @st.cache_data(ttl=300, show_spinner=False)
