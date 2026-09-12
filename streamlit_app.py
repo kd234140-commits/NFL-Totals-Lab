@@ -11,11 +11,18 @@ import pandas as pd
 import requests
 import streamlit as st
 
+try:
+    from v2_side_live import build_side_prediction
+    V2_SIDE_IMPORT_ERROR = None
+except Exception as _v2_exc:
+    build_side_prediction = None
+    V2_SIDE_IMPORT_ERROR = str(_v2_exc)
+
 # -----------------------------
 # App configuration
 # -----------------------------
 st.set_page_config(
-    page_title="NFL Totals Lab — Auto Data",
+    page_title="NFL Betting Lab — Auto Data",
     page_icon="🏈",
     layout="wide",
 )
@@ -120,21 +127,22 @@ FEATURES = [
     "Div_Game",
 ]
 
-PBP_COLS = [
-    "game_id",
-    "season",
-    "season_type",
-    "week",
-    "posteam",
-    "defteam",
-    "pass",
-    "rush",
-    "epa",
-    "yards_gained",
-    "interception",
-    "fumble_lost",
-    "sack",
+PBP_REQUIRED = [
+    "game_id", "season", "season_type", "week", "posteam", "defteam",
+    "pass", "rush", "epa", "yards_gained", "interception", "fumble_lost", "sack",
 ]
+
+# V1 only needs PBP_REQUIRED. The extra fields let the frozen V2.2 side model
+# reproduce its drive, matchup, pace and scoring features live.
+PBP_COLS = sorted(set(PBP_REQUIRED + [
+    "home_team", "away_team", "drive", "fixed_drive", "no_play", "down",
+    "ydstogo", "yardline_100", "air_yards", "yards_after_catch", "success",
+    "wp", "score_differential", "qb_dropback", "pass_attempt", "rush_attempt",
+    "qb_scramble", "qb_kneel", "qb_spike", "touchdown", "td_team",
+    "field_goal_result", "extra_point_result", "two_point_conv_result",
+    "first_down", "shotgun", "no_huddle", "xpass", "cpoe",
+    "third_down_converted", "fourth_down_converted",
+]))
 
 # -----------------------------
 # Local model files
@@ -172,7 +180,7 @@ def load_pbp(season: int) -> pd.DataFrame:
         usecols=lambda c: c in PBP_COLS,
         low_memory=False,
     )
-    missing = [c for c in PBP_COLS if c not in df.columns]
+    missing = [c for c in PBP_REQUIRED if c not in df.columns]
     if missing:
         raise RuntimeError(f"nflverse play-by-play is missing expected columns: {missing}")
     return df
@@ -594,8 +602,8 @@ def fmt_odds(x):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("🏈 NFL Totals Lab — Auto Data")
-st.caption("Schedule + team metrics + weather load automatically. Live sportsbook odds can load automatically with The Odds API.")
+st.title("🏈 NFL Betting Lab — Auto Data")
+st.caption("Totals + V2.2 spread/moneyline probabilities + weather + live sportsbook prices. Data refreshes automatically.")
 
 
 with st.sidebar:
@@ -700,7 +708,7 @@ if book_rows:
 fallback_total = to_float(game.get("total_line"), 44.5)
 fallback_over = to_float(game.get("over_odds"), -110)
 fallback_under = to_float(game.get("under_odds"), -110)
-fallback_spread = to_float(game.get("spread_line"), 0.0)
+fallback_spread = -to_float(game.get("spread_line"), 0.0)
 
 if selected_book_row:
     default_total = selected_book_row["total"] or fallback_total
@@ -937,90 +945,142 @@ else:
     st.info("V1 filter says PASS.")
 
 # -----------------------------
-# Spread & Moneyline EV
+# V2.2 Spread & Moneyline Model
 # -----------------------------
-st.subheader("Spread & Moneyline EV")
-
-selected_key = selected_book_row.get("key") if selected_book_row else None
-
-ml_home_p, ml_away_p, ml_books, ml_used_selected = consensus_moneyline(
-    book_rows, selected_key=selected_key
-)
-sp_home_p, sp_away_p, sp_books, sp_used_selected = consensus_spread(
-    book_rows, float(home_spread), selected_key=selected_key
+st.subheader("V2.2 Spread & Moneyline Model")
+st.caption(
+    "This is the frozen V2.2 side model being forward-tested on 2026 games. "
+    "It predicts the game margin, then converts that margin distribution into moneyline win probability and spread cover probability."
 )
 
-if book_rows and ml_home_p is not None:
-    home_ml_ev = ev_from_prob(ml_home_p, float(home_ml))
-    away_ml_ev = ev_from_prob(ml_away_p, float(away_ml))
+v2_result = None
+v2_error = None
+if build_side_prediction is None:
+    v2_error = f"V2.2 module could not load: {V2_SIDE_IMPORT_ERROR}"
+else:
+    try:
+        with st.spinner("Building V2.2 live side features and running the frozen model…"):
+            v2_result = build_side_prediction(
+                root=ROOT,
+                schedule=schedule,
+                game=game,
+                prev_pbp=prev_pbp,
+                cur_pbp=cur_pbp,
+                home=home,
+                away=away,
+                season=season,
+                week=week,
+                market_total=float(market_total),
+                over_odds=float(over_odds),
+                under_odds=float(under_odds),
+                home_spread=float(home_spread),
+                home_spread_odds=float(home_spread_odds),
+                away_spread_odds=float(away_spread_odds),
+                home_ml=float(home_ml),
+                away_ml=float(away_ml),
+                dome=float(dome),
+            )
+    except Exception as exc:
+        v2_error = str(exc)
+
+if v2_error:
+    st.error(f"V2.2 side model could not run: {v2_error}")
+    st.caption("The older market-consensus comparison is still available below as a fallback.")
+
+if v2_result:
+    margin = float(v2_result["predicted_margin"])
+    margin_label = f"{home} by {margin:.1f}" if margin >= 0 else f"{away} by {abs(margin):.1f}"
+    a, b, c, d = st.columns(4)
+    a.metric("V2.2 projected margin", margin_label)
+    b.metric("Sportsbook home spread", f"{home_spread:+.1f}")
+    c.metric("Live feature coverage", f"{v2_result['coverage']:.0%}")
+    d.metric("Status", "2026 forward test")
 
     st.markdown("##### Moneyline")
     a, b, c, d = st.columns(4)
-    a.metric(f"{home} fair win probability", f"{ml_home_p:.1%}")
-    b.metric(f"{home} ML EV", f"{home_ml_ev:+.1%}")
-    c.metric(f"{away} fair win probability", f"{ml_away_p:.1%}")
-    d.metric(f"{away} ML EV", f"{away_ml_ev:+.1%}")
+    a.metric(f"{home} win probability", f"{v2_result['p_home_win']:.1%}")
+    b.metric(f"{home} ML EV", f"{v2_result['home_ml_ev']:+.1%}")
+    c.metric(f"{away} win probability", f"{v2_result['p_away_win']:.1%}")
+    d.metric(f"{away} ML EV", f"{v2_result['away_ml_ev']:+.1%}")
 
     a, b, c, d = st.columns(4)
-    a.metric(f"{home} fair ML", fmt_odds(fair_american(ml_home_p)))
+    a.metric(f"{home} fair ML", fmt_odds(v2_result["fair_home_ml"]))
     b.metric(f"{home} offered ML", fmt_odds(home_ml))
-    c.metric(f"{away} fair ML", fmt_odds(fair_american(ml_away_p)))
+    c.metric(f"{away} fair ML", fmt_odds(v2_result["fair_away_ml"]))
     d.metric(f"{away} offered ML", fmt_odds(away_ml))
-
-    ml_note = (
-        f"Fair moneyline probability is the average de-vigged probability from "
-        f"{ml_books} {'other sportsbook' if ml_books == 1 else 'other sportsbooks'}."
-    )
-    if ml_used_selected:
-        ml_note += " No other-book pair was available, so the selected book was used."
-    st.caption(ml_note)
-else:
-    st.info("Moneyline EV needs live h2h prices from The Odds API.")
-
-if book_rows and sp_home_p is not None:
-    home_spread_ev = ev_from_prob(sp_home_p, float(home_spread_odds))
-    away_spread_ev = ev_from_prob(sp_away_p, float(away_spread_odds))
 
     st.markdown("##### Point spread")
     a, b, c, d = st.columns(4)
-    a.metric(f"{home} {home_spread:+.1f} fair cover %", f"{sp_home_p:.1%}")
-    b.metric(f"{home} spread EV", f"{home_spread_ev:+.1%}")
-    c.metric(f"{away} {-home_spread:+.1f} fair cover %", f"{sp_away_p:.1%}")
-    d.metric(f"{away} spread EV", f"{away_spread_ev:+.1%}")
+    a.metric(f"{home} {home_spread:+.1f} cover probability", f"{v2_result['p_home_cover']:.1%}")
+    b.metric(f"{home} spread EV", f"{v2_result['home_spread_ev']:+.1%}")
+    c.metric(f"{away} {-home_spread:+.1f} cover probability", f"{v2_result['p_away_cover']:.1%}")
+    d.metric(f"{away} spread EV", f"{v2_result['away_spread_ev']:+.1%}")
 
     a, b, c, d = st.columns(4)
-    a.metric(f"{home} fair spread odds", fmt_odds(fair_american(sp_home_p)))
+    a.metric(f"{home} fair spread odds", fmt_odds(v2_result["fair_home_spread"]))
     b.metric(f"{home} offered odds", fmt_odds(home_spread_odds))
-    c.metric(f"{away} fair spread odds", fmt_odds(fair_american(sp_away_p)))
+    c.metric(f"{away} fair spread odds", fmt_odds(v2_result["fair_away_spread"]))
     d.metric(f"{away} offered odds", fmt_odds(away_spread_odds))
 
-    spread_note = (
-        f"Spread consensus uses {sp_books} "
-        f"{'sportsbook' if sp_books == 1 else 'sportsbooks'} posting the same "
-        f"{home} {home_spread:+.1f} line."
+    fam = v2_result.get("families", {})
+    loaded_names = [k.upper() for k, ok in fam.items() if ok]
+    missing_names = [k.upper() for k, ok in fam.items() if not ok]
+    st.caption(
+        f"Selected-feature coverage: {v2_result['coverage']:.1%} of "
+        f"{v2_result['selected_feature_count']} features selected by the frozen models are populated live. "
+        f"Loaded families: {', '.join(loaded_names) if loaded_names else 'none'}. "
+        f"Imputed/unavailable families: {', '.join(missing_names) if missing_names else 'none'}."
     )
-    if sp_used_selected:
-        spread_note += " Other books at the exact same spread were unavailable, so the selected book was included."
-    st.caption(spread_note)
-else:
-    st.info(
-        f"No consensus was available for the exact {home} {home_spread:+.1f} spread. "
-        "This can happen when other books are hanging a different number."
-    )
+    if v2_result["coverage"] < 0.70:
+        st.warning(
+            "V2.2 is running with substantial missing live feature data. The saved training pipelines impute missing values, "
+            "but treat the probabilities cautiously until live feature coverage improves."
+        )
+    else:
+        st.info(
+            "These are frozen-model forward-test probabilities, not a guarantee of profit. "
+            "The 2026 results should be tracked without retuning the model to see whether the historical edge holds up."
+        )
 
-st.caption(
-    "Spread and moneyline EV here are **market-consensus EV**, not V1 model EV. "
-    "The app removes the vig from sportsbook prices and compares the selected book's price "
-    "with the consensus fair probability. A predictive side model would be a separate Version 2 project."
-)
+# Keep the market-consensus comparison available as a useful independent check.
+selected_key = selected_book_row.get("key") if selected_book_row else None
+ml_home_p, ml_away_p, ml_books, ml_used_selected = consensus_moneyline(book_rows, selected_key=selected_key)
+sp_home_p, sp_away_p, sp_books, sp_used_selected = consensus_spread(book_rows, float(home_spread), selected_key=selected_key)
+
+with st.expander("Compare V2.2 with sportsbook consensus"):
+    if book_rows and ml_home_p is not None:
+        st.markdown("**Moneyline consensus**")
+        a, b = st.columns(2)
+        a.metric(f"{home} consensus fair win %", f"{ml_home_p:.1%}")
+        b.metric(f"{away} consensus fair win %", f"{ml_away_p:.1%}")
+        if v2_result:
+            st.caption(
+                f"V2.2 vs consensus: {home} {v2_result['p_home_win'] - ml_home_p:+.1%} probability difference."
+            )
+    else:
+        st.caption("No complete moneyline consensus is available from the current Odds API response.")
+
+    if book_rows and sp_home_p is not None:
+        st.markdown("**Exact-line spread consensus**")
+        a, b = st.columns(2)
+        a.metric(f"{home} {home_spread:+.1f} consensus cover %", f"{sp_home_p:.1%}")
+        b.metric(f"{away} {-home_spread:+.1f} consensus cover %", f"{sp_away_p:.1%}")
+        if v2_result:
+            st.caption(
+                f"V2.2 vs consensus: {home} spread probability difference "
+                f"{v2_result['p_home_cover'] - sp_home_p:+.1%}."
+            )
+    else:
+        st.caption("No other-book consensus is available at this exact spread number.")
 
 st.divider()
 with st.expander("Data sources & refresh behavior"):
     st.markdown(
         """
 - **Schedule / game metadata:** nflverse `games.csv`
-- **Team EPA / success / explosive / play volume / turnovers / sacks:** calculated from nflverse play-by-play
-- **Weather:** Open-Meteo stadium-area forecast
+- **V1 totals inputs:** calculated from nflverse play-by-play
+- **V2.2 spread/ML inputs:** nflverse play-by-play, weekly player/QB stats, ESPN QBR, Next Gen Stats, snap counts, depth charts, and live market prices when available
+- **Weather:** Open-Meteo stadium-area forecast (used by V1 totals; V2.2 side model was trained without observed game-weather leakage)
 - **Sportsbook totals / spreads / moneylines / prices:** The Odds API when a key is configured
 - **Fallback line:** nflverse schedule snapshot or manual override
 - Schedule refresh cache: ~30 minutes
@@ -1035,4 +1095,5 @@ with st.expander("Model status"):
         f"V1 historical holdout: {int(HOLDOUT['Wins'])}-{int(HOLDOUT['Losses'])}, "
         f"{float(HOLDOUT['Win_Pct']):.1%} wins, {float(HOLDOUT['ROI']):.1%} ROI."
     )
+    st.caption("V2.2 spread/moneyline model: frozen after 2018–2025 training and now labeled as a 2026 forward test. Totals remain on V1 while the separate totals R&D continues.")
 

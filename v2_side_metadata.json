@@ -1,0 +1,12 @@
+{
+  "created_utc": "2026-09-12T11:06:48.500501+00:00",
+  "model_name": "NFL V2.2 Side Model",
+  "status": "Frozen for 2026 forward testing",
+  "training_games": 2227,
+  "training_seasons": "2018-2025",
+  "feature_count": 657,
+  "sigma_margin": 12.75458626568968,
+  "spread_convention": "spread_line is positive when the home team is favored; sportsbook display home spread is negative when home is favored.",
+  "probability_method": "Normal distribution around final predicted home margin using sigma_margin.",
+  "deployment_warning": "Live predictions must generate the same pregame feature definitions used during training. Missing live fields may be imputed by the saved pipelines, but systematic missing feature families should be disclosed."
+}
