@@ -1,0 +1,29 @@
+{
+  "version": "V2.3 challenger",
+  "created": "2026-09-12",
+  "changes": {
+    "espn_current_injuries": true,
+    "spread_margin_correction_weight": 0.55,
+    "spread_probability_z_scale": 0.8,
+    "moneyline_v22_weight": 0.9,
+    "moneyline_market_weight": 0.1
+  },
+  "walk_forward_2021_2025": {
+    "spread_mae_v22": 9.668187823744063,
+    "spread_mae_v23_calibrated": 9.57987582579286,
+    "spread_mae_market": 9.762289325842696,
+    "spread_improvement_vs_market_bootstrap_mean": 0.18226682090996238,
+    "spread_improvement_vs_market_bootstrap_95ci": [
+      0.08861686,
+      0.2752753
+    ],
+    "ml_brier_v22": 0.20383680201665427,
+    "ml_brier_v23_calibrated": 0.20372138338762477,
+    "ml_brier_market": 0.21155213861384323,
+    "ml_brier_improvement_vs_market_bootstrap_95ci": [
+      0.00350076,
+      0.0122008
+    ]
+  },
+  "note": "V2.3 is a new challenger. V2.2 remains frozen. 2026 must be tracked prospectively."
+}

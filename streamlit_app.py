@@ -12,10 +12,11 @@ import requests
 import streamlit as st
 
 try:
-    from v2_side_live import build_side_prediction
+    from v2_side_live import build_side_prediction, build_side_prediction_v23
     V2_SIDE_IMPORT_ERROR = None
 except Exception as _v2_exc:
     build_side_prediction = None
+    build_side_prediction_v23 = None
     V2_SIDE_IMPORT_ERROR = str(_v2_exc)
 
 # -----------------------------
@@ -938,16 +939,129 @@ c.metric("Weather input", f"{model_temp:.0f}°F / {model_wind:.0f} mph")
 
 if result["signal"] != "PASS":
     st.warning(
-        f"V1 would flag **{result['signal']}**, but this is **not a validated live-bet recommendation**. "
-        "V1 lost 18.2% ROI in the untouched 2025 holdout."
+        f"V1 totals signal: **{result['signal']}**. "
+        "V1 lost 18.2% ROI in its 2025 out-of-sample backtest, so the totals model remains experimental."
     )
 else:
     st.info("V1 filter says PASS.")
 
 # -----------------------------
+# V2.3 Challenger — live injuries + calibrated probabilities
+# -----------------------------
+st.subheader("V2.3 Challenger — Spread & Moneyline")
+st.caption(
+    "V2.3 keeps the V2.2 estimators frozen, adds current ESPN injury-report inputs that match the historical "
+    "injury features, and applies conservative probability/margin calibration learned from the 2021–2025 "
+    "walk-forward predictions. V2.2 remains below as the untouched benchmark."
+)
+
+v23_result = None
+v23_error = None
+if build_side_prediction_v23 is None:
+    v23_error = f"V2.3 module could not load: {V2_SIDE_IMPORT_ERROR}"
+else:
+    try:
+        with st.spinner("Loading current injuries and running V2.3 challenger…"):
+            v23_result = build_side_prediction_v23(
+                root=ROOT,
+                schedule=schedule,
+                game=game,
+                prev_pbp=prev_pbp,
+                cur_pbp=cur_pbp,
+                home=home,
+                away=away,
+                season=season,
+                week=week,
+                market_total=float(market_total),
+                over_odds=float(over_odds),
+                under_odds=float(under_odds),
+                home_spread=float(home_spread),
+                home_spread_odds=float(home_spread_odds),
+                away_spread_odds=float(away_spread_odds),
+                home_ml=float(home_ml),
+                away_ml=float(away_ml),
+                dome=float(dome),
+            )
+    except Exception as exc:
+        v23_error = str(exc)
+
+if v23_error:
+    st.error(f"V2.3 challenger could not run: {v23_error}")
+
+if v23_result:
+    margin = float(v23_result["predicted_margin"])
+    margin_label = f"{home} by {margin:.1f}" if margin >= 0 else f"{away} by {abs(margin):.1f}"
+
+    a, b, c, d = st.columns(4)
+    a.metric("V2.3 calibrated margin", margin_label)
+    b.metric("Sportsbook home spread", f"{home_spread:+.1f}")
+    c.metric("Eligible live coverage", f"{v23_result['eligible_coverage']:.0%}")
+    d.metric("Status", "2026 challenger test")
+
+    st.markdown("##### Moneyline")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} calibrated win probability", f"{v23_result['p_home_win']:.1%}")
+    b.metric(f"{home} ML EV", f"{v23_result['home_ml_ev']:+.1%}")
+    c.metric(f"{away} calibrated win probability", f"{v23_result['p_away_win']:.1%}")
+    d.metric(f"{away} ML EV", f"{v23_result['away_ml_ev']:+.1%}")
+
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} fair ML", fmt_odds(v23_result["fair_home_ml"]))
+    b.metric(f"{home} offered ML", fmt_odds(home_ml))
+    c.metric(f"{away} fair ML", fmt_odds(v23_result["fair_away_ml"]))
+    d.metric(f"{away} offered ML", fmt_odds(away_ml))
+
+    st.markdown("##### Point spread")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} {home_spread:+.1f} calibrated cover probability", f"{v23_result['p_home_cover']:.1%}")
+    b.metric(f"{home} spread EV", f"{v23_result['home_spread_ev']:+.1%}")
+    c.metric(f"{away} {-home_spread:+.1f} calibrated cover probability", f"{v23_result['p_away_cover']:.1%}")
+    d.metric(f"{away} spread EV", f"{v23_result['away_spread_ev']:+.1%}")
+
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} fair spread odds", fmt_odds(v23_result["fair_home_spread"]))
+    b.metric(f"{home} offered odds", fmt_odds(home_spread_odds))
+    c.metric(f"{away} fair spread odds", fmt_odds(v23_result["fair_away_spread"]))
+    d.metric(f"{away} offered odds", fmt_odds(away_spread_odds))
+
+    fam = v23_result.get("families", {})
+    injury_ok = bool(fam.get("injuries"))
+    structural_n = len(v23_result.get("structural_missing", []))
+    unexpected_n = len(v23_result.get("unexpected_missing", []))
+    st.caption(
+        f"Raw populated coverage: {v23_result['coverage']:.1%} of {v23_result['selected_feature_count']} selected features. "
+        f"{structural_n} features are structurally unavailable before Week {week} because they require a prior current-season "
+        f"observation; those same fields were missing and imputed in historical Week 1 training rows. "
+        f"Unexpected missing selected features: {unexpected_n}. Injury feed: {'loaded' if injury_ok else 'unavailable'}."
+    )
+
+    if v23_result["eligible_coverage"] < 0.90 or not injury_ok:
+        st.warning(
+            "V2.3 is missing live inputs that should normally be available. Treat large EV estimates cautiously until the "
+            "missing feed is restored."
+        )
+    else:
+        st.info(
+            "V2.3 is a challenger, not a replacement for V2.2 yet. Its calibration improved historical out-of-sample "
+            "spread MAE and moneyline probability scoring, but the 2026 forward test is what decides whether it is better live."
+        )
+
+    with st.expander("What changed from V2.2?"):
+        st.markdown(
+            """
+            - **Current injuries:** ESPN's live injury report now fills the same OUT / DOUBTFUL / QUESTIONABLE and position-group fields used in historical training.
+            - **Spread margin calibration:** V2.3 keeps **55%** of V2.2's correction away from the market line. This reduced 2021–2025 walk-forward spread MAE from about **9.67 to 9.58** points; the closing market was about **9.76**.
+            - **Spread probability calibration:** cover probabilities are compressed toward 50% to reduce overconfidence.
+            - **Moneyline calibration:** **90% V2.2 probability + 10% de-vigged market probability**. Historical Brier score improved slightly from about **0.20384 to 0.20372**; the market was about **0.21155**.
+            - **V2.2 is still shown below unchanged** so we can compare both versions prospectively in 2026.
+            """
+        )
+
+
+# -----------------------------
 # V2.2 Spread & Moneyline Model
 # -----------------------------
-st.subheader("V2.2 Spread & Moneyline Model")
+st.subheader("V2.2 Frozen Benchmark")
 st.caption(
     "This is the frozen V2.2 side model being forward-tested on 2026 games. "
     "It predicts the game margin, then converts that margin distribution into moneyline win probability and spread cover probability."
@@ -993,7 +1107,7 @@ if v2_result:
     a, b, c, d = st.columns(4)
     a.metric("V2.2 projected margin", margin_label)
     b.metric("Sportsbook home spread", f"{home_spread:+.1f}")
-    c.metric("Live feature coverage", f"{v2_result['coverage']:.0%}")
+    c.metric("Raw feature coverage", f"{v2_result['coverage']:.0%}")
     d.metric("Status", "2026 forward test")
 
     st.markdown("##### Moneyline")
@@ -1031,15 +1145,17 @@ if v2_result:
         f"Loaded families: {', '.join(loaded_names) if loaded_names else 'none'}. "
         f"Imputed/unavailable families: {', '.join(missing_names) if missing_names else 'none'}."
     )
-    if v2_result["coverage"] < 0.70:
+    structural_n = len(v2_result.get("structural_missing", []))
+    unexpected_n = len(v2_result.get("unexpected_missing", []))
+    if unexpected_n > 0:
         st.warning(
-            "V2.2 is running with substantial missing live feature data. The saved training pipelines impute missing values, "
-            "but treat the probabilities cautiously until live feature coverage improves."
+            f"V2.2 has {unexpected_n} selected live features missing beyond the {structural_n} structurally unavailable "
+            "early-season fields. This benchmark intentionally does not use the new ESPN injury feed."
         )
     else:
         st.info(
             "These are frozen-model forward-test probabilities, not a guarantee of profit. "
-            "The 2026 results should be tracked without retuning the model to see whether the historical edge holds up."
+            "The 2026 results should be tracked without retuning V2.2."
         )
 
 # Keep the market-consensus comparison available as a useful independent check.

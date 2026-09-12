@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+from statistics import NormalDist
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 try:
@@ -16,6 +18,10 @@ except Exception:
     nfl = None
 
 QBR_URL = "https://github.com/nflverse/nflverse-data/releases/download/espn_data/qbr_week_level.parquet"
+ESPN_INJURIES_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
+V23_SPREAD_MARGIN_SHRINK = 0.55
+V23_SPREAD_PROB_SCALE = 0.80
+V23_ML_MODEL_WEIGHT = 0.90
 ALPHA = 0.35
 TEAM_MAP = {"OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX", "WSH": "WAS"}
 POSITION_GROUP = {
@@ -611,6 +617,122 @@ def build_depth_features(season:int, game_date, home:str, away:str):
     return out,got
 
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_espn_injuries():
+    """Current ESPN league-wide injury report. Public endpoint; no API key."""
+    try:
+        r = requests.get(
+            ESPN_INJURIES_URL,
+            timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 NFL-Betting-Lab/1.0"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _injury_pg(pos):
+    p = str(pos or "").upper().strip()
+    if p == "QB":
+        return "QB"
+    if p in {"T","OT","G","OG","C","OL"}:
+        return "OL"
+    if p in {"RB","FB"}:
+        return "RB"
+    if p in {"WR","TE"}:
+        return "WRTE"
+    if p in {"DE","DT","NT","DL","EDGE"}:
+        return "DL"
+    if p in {"LB","ILB","OLB"}:
+        return "LB"
+    if p in {"CB","S","FS","SS","DB"}:
+        return "DB"
+    return "OTHER"
+
+
+def build_espn_injury_features(home: str, away: str):
+    """
+    Reproduce the historical V2 injury feature definitions using ESPN's
+    current league-wide injury report.
+
+    Historical training features:
+      inj_out_count / inj_doubtful_count / inj_questionable_count
+      inj_{position_group}_listed / inj_{position_group}_out
+    """
+    data = load_espn_injuries()
+    groups = data.get("injuries", []) if isinstance(data, dict) else []
+    if not isinstance(groups, list) or not groups:
+        return {}, False, {"source": "ESPN", "teams_found": []}
+
+    by_team = {}
+    for grp in groups:
+        if not isinstance(grp, dict):
+            continue
+        team = norm_team((grp.get("team") or {}).get("abbreviation"))
+        items = grp.get("injuries", [])
+        if team and isinstance(items, list):
+            by_team[team] = items
+
+    out = {}
+    found = []
+    for side, team in [("home", home), ("away", away)]:
+        items = by_team.get(team)
+        if items is None:
+            continue
+        found.append(team)
+        rows = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ath = item.get("athlete") or {}
+            pos = (ath.get("position") or {}).get("abbreviation")
+            status = str(item.get("status") or "").upper().strip()
+            rows.append((_injury_pg(pos), status))
+
+        # Status counts match the original historical builder.
+        for st in ["OUT", "DOUBTFUL", "QUESTIONABLE"]:
+            out[f"{side}_inj_{st.lower()}_count"] = int(sum(s == st for _, s in rows))
+
+        for pg in ["QB", "OL", "RB", "WRTE", "DL", "LB", "DB"]:
+            rr = [(g, s) for g, s in rows if g == pg]
+            out[f"{side}_inj_{pg.lower()}_listed"] = int(len(rr))
+            out[f"{side}_inj_{pg.lower()}_out"] = int(sum(s == "OUT" for _, s in rr))
+
+    ok = home in found and away in found
+    return out, ok, {"source": "ESPN", "teams_found": found}
+
+
+def _structural_missing(selected, missing, week: int):
+    """
+    Week 1 has no prior current-season observations, so within-season expanding
+    means (*_std in this builder) are intentionally NA, just as they were in
+    historical training. Do not count those as a broken live feed.
+    """
+    if int(week) <= 1:
+        return [c for c in missing if str(c).endswith("_std")]
+    return []
+
+
+def _coverage_report(selected, live, week: int):
+    missing = [c for c in selected if pd.isna(live.get(c, np.nan))]
+    structural = _structural_missing(selected, missing, week)
+    unexpected = [c for c in missing if c not in set(structural)]
+    populated = len(selected) - len(missing)
+    eligible = max(1, len(selected) - len(structural))
+    return {
+        "coverage": populated / max(1, len(selected)),
+        "eligible_coverage": (eligible - len(unexpected)) / eligible,
+        "missing": missing,
+        "structural_missing": structural,
+        "unexpected_missing": unexpected,
+        "eligible_count": eligible,
+    }
+
+
+
 def selected_feature_names(bundle):
     feats=bundle["features"]
     idx=set()
@@ -628,6 +750,7 @@ def build_side_prediction(
     home: str, away: str, season: int, week: int, market_total: float,
     over_odds: float, under_odds: float, home_spread: float, home_spread_odds: float,
     away_spread_odds: float, home_ml: float, away_ml: float, dome: float,
+    include_live_injuries: bool = False,
 ):
     bundle, meta=load_side_bundle(str(root))
     features=list(bundle["features"])
@@ -683,6 +806,15 @@ def build_side_prediction(
     except Exception:
         pass
 
+    injury_meta = {"source": "none", "teams_found": []}
+    if include_live_injuries:
+        try:
+            z,ok,injury_meta=build_espn_injury_features(home,away)
+            live.update({k:v for k,v in z.items() if k in live})
+            fam["injuries"]=ok
+        except Exception:
+            fam["injuries"]=False
+
     # QB-change flags: reproduce the historical builder from prior schedule starters when possible.
     try:
         sched = schedule.copy()
@@ -723,9 +855,9 @@ def build_side_prediction(
     p_away_win=1-p_home_win; p_away_cover=1-p_home_cover
 
     selected=selected_feature_names(bundle)
-    vals=pd.Series({c:live.get(c,np.nan) for c in selected})
-    coverage=float(vals.notna().mean()) if len(vals) else 0.0
-    missing=[c for c in selected if pd.isna(live.get(c,np.nan))]
+    cov=_coverage_report(selected,live,week)
+    coverage=float(cov["coverage"])
+    missing=list(cov["missing"])
 
     return {
         "model_name":meta.get("model_name","NFL V2.2 Side Model"),
@@ -739,7 +871,81 @@ def build_side_prediction(
         "fair_home_spread":fair_american(p_home_cover),"fair_away_spread":fair_american(p_away_cover),
         "home_ml_ev":ev(p_home_win,home_ml),"away_ml_ev":ev(p_away_win,away_ml),
         "home_spread_ev":ev(p_home_cover,home_spread_odds),"away_spread_ev":ev(p_away_cover,away_spread_odds),
-        "coverage":coverage,"selected_feature_count":len(selected),"missing_selected":missing,
+        "coverage":coverage,
+        "eligible_coverage":float(cov["eligible_coverage"]),
+        "selected_feature_count":len(selected),
+        "eligible_feature_count":int(cov["eligible_count"]),
+        "missing_selected":missing,
+        "structural_missing":list(cov["structural_missing"]),
+        "unexpected_missing":list(cov["unexpected_missing"]),
         "families":fam,"spread_line_model":spread_line,
+        "injury_meta":injury_meta,
         "home_qb_id":home_qb,"away_qb_id":away_qb,
     }
+
+
+def build_side_prediction_v23(**kwargs):
+    """
+    V2.3 challenger:
+      * same frozen V2.2 estimators (no retraining / no leakage)
+      * fills the historical injury feature family from current ESPN reports
+      * shrinks the margin correction toward the sportsbook line
+      * calibrates spread probability magnitude
+      * blends moneyline probability 90% model / 10% de-vig market
+
+    Calibration constants were chosen from 2021-2025 walk-forward predictions,
+    then frozen before the 2026 challenger forward test.
+    """
+    kw = dict(kwargs)
+    kw["include_live_injuries"] = True
+    r = build_side_prediction(**kw)
+
+    # More conservative margin prediction. V2.2's market-relative correction
+    # was useful but too large on average; historical OOS MAE improved when
+    # retaining 55% of the correction.
+    spread_line = float(r["spread_line_model"])
+    r["v22_predicted_margin"] = float(r["predicted_margin"])
+    r["predicted_margin"] = spread_line + V23_SPREAD_MARGIN_SHRINK * (float(r["predicted_margin"]) - spread_line)
+
+    # Spread probability calibration: compress distance from 50% without
+    # changing the preferred side.
+    nd = NormalDist()
+    ph = min(max(float(r["p_home_cover"]), 1e-6), 1 - 1e-6)
+    z = nd.inv_cdf(ph)
+    p_home_cover = nd.cdf(V23_SPREAD_PROB_SCALE * z)
+    p_away_cover = 1.0 - p_home_cover
+
+    # Moneyline calibration: modest shrinkage toward the de-vigged offered market.
+    home_ml = float(kwargs["home_ml"])
+    away_ml = float(kwargs["away_ml"])
+    mh, ma, _ = devig(home_ml, away_ml)
+    p_model = float(r["p_home_win"])
+    if np.isfinite(mh):
+        p_home_win = V23_ML_MODEL_WEIGHT * p_model + (1.0 - V23_ML_MODEL_WEIGHT) * mh
+    else:
+        p_home_win = p_model
+    p_home_win = min(max(p_home_win, 1e-6), 1 - 1e-6)
+    p_away_win = 1.0 - p_home_win
+
+    r.update({
+        "model_name": "NFL V2.3 Challenger",
+        "status": "2026 challenger forward test",
+        "p_home_win": p_home_win,
+        "p_away_win": p_away_win,
+        "p_home_cover": p_home_cover,
+        "p_away_cover": p_away_cover,
+        "fair_home_ml": fair_american(p_home_win),
+        "fair_away_ml": fair_american(p_away_win),
+        "fair_home_spread": fair_american(p_home_cover),
+        "fair_away_spread": fair_american(p_away_cover),
+        "home_ml_ev": ev(p_home_win, home_ml),
+        "away_ml_ev": ev(p_away_win, away_ml),
+        "home_spread_ev": ev(p_home_cover, float(kwargs["home_spread_odds"])),
+        "away_spread_ev": ev(p_away_cover, float(kwargs["away_spread_odds"])),
+        "calibration": {
+            "spread_margin_shrink": V23_SPREAD_MARGIN_SHRINK,
+            "spread_probability_scale": V23_SPREAD_PROB_SCALE,
+            "moneyline_model_weight": V23_ML_MODEL_WEIGHT,
+        },
+    })
+    return r
