@@ -19,10 +19,11 @@ except Exception as _v22_exc:
     V22_SIDE_IMPORT_ERROR = str(_v22_exc)
 
 try:
-    from v2_side_live_v23 import build_side_prediction_v23
+    from v2_side_live_v23 import build_side_prediction_v23, get_free_breaking_news
     V23_SIDE_IMPORT_ERROR = None
 except Exception as _v23_exc:
     build_side_prediction_v23 = None
+    get_free_breaking_news = None
     V23_SIDE_IMPORT_ERROR = str(_v23_exc)
 
 # -----------------------------
@@ -956,8 +957,8 @@ else:
 # -----------------------------
 st.subheader("V2.3 Challenger — Spread & Moneyline")
 st.caption(
-    "V2.3 keeps the V2.2 estimators frozen, adds current ESPN injury-report inputs that match the historical "
-    "injury features, and applies conservative probability/margin calibration learned from the 2021–2025 "
+    "V2.3 keeps the V2.2 estimators frozen, adds a free multi-source injury layer (official NFL.com + ESPN + Sleeper) "
+    "that matches the historical injury features, and applies conservative probability/margin calibration learned from the 2021–2025 "
     "walk-forward predictions. V2.2 remains below as the untouched benchmark."
 )
 
@@ -967,7 +968,7 @@ if build_side_prediction_v23 is None:
     v23_error = f"V2.3 module could not load: {V23_SIDE_IMPORT_ERROR}"
 else:
     try:
-        with st.spinner("Loading current injuries and running V2.3 challenger…"):
+        with st.spinner("Loading free injury sources and running V2.3 challenger…"):
             v23_result = build_side_prediction_v23(
                 root=ROOT,
                 schedule=schedule,
@@ -1038,7 +1039,8 @@ if v23_result:
         f"Raw populated coverage: {v23_result['coverage']:.1%} of {v23_result['selected_feature_count']} selected features. "
         f"{structural_n} features are structurally unavailable before Week {week} because they require a prior current-season "
         f"observation; those same fields were missing and imputed in historical Week 1 training rows. "
-        f"Unexpected missing selected features: {unexpected_n}. Injury feed: {'loaded' if injury_ok else 'unavailable'}."
+        f"Unexpected missing selected features: {unexpected_n}. Injury feed: {'loaded' if injury_ok else 'unavailable'}. "
+        f"Source: {v23_result.get('injury_meta', {}).get('source', 'none')}."
     )
 
     if v23_result["eligible_coverage"] < 0.90 or not injury_ok:
@@ -1052,10 +1054,57 @@ if v23_result:
             "spread MAE and moneyline probability scoring, but the 2026 forward test is what decides whether it is better live."
         )
 
+    with st.expander("Free injury + breaking-news inputs"):
+        imeta = v23_result.get("injury_meta", {}) or {}
+        st.write(f"**Injury sources used:** {imeta.get('source', 'none')}")
+        detail = imeta.get("source_detail", {}) or {}
+        if detail:
+            rows=[]
+            for tm, vals in detail.items():
+                rows.append({"Team": tm, "NFL.com": vals.get("official",0), "ESPN": vals.get("espn",0), "Sleeper": vals.get("sleeper",0), "Merged players": vals.get("merged",0)})
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        player_map = imeta.get("players", {}) or {}
+        injury_rows=[]
+        for tm in [home, away]:
+            for r in player_map.get(tm, []) or []:
+                if r.get("status") or r.get("practice"):
+                    injury_rows.append({
+                        "Team":tm, "Player":r.get("player",""), "Pos":r.get("position",""),
+                        "Game status":r.get("status","") or "—", "Practice":r.get("practice","") or "—",
+                        "Injury":r.get("injury","") or "—", "Source":r.get("source","")
+                    })
+        if injury_rows:
+            st.dataframe(pd.DataFrame(injury_rows), width="stretch", hide_index=True)
+        else:
+            st.caption("No player-level injury rows were returned for this matchup.")
+
+        st.markdown("**Breaking-news watch (free Google News RSS)**")
+        st.caption("Headlines are shown for review only and do not automatically override the model. This avoids a vague or misquoted headline changing a bet.")
+        if get_free_breaking_news is not None:
+            try:
+                news_items = get_free_breaking_news(home, away, 8)
+            except Exception:
+                news_items = []
+        else:
+            news_items = []
+        if news_items:
+            for nitem in news_items:
+                title=nitem.get("title","Breaking NFL update")
+                link=nitem.get("link","")
+                src=nitem.get("source","")
+                pub=nitem.get("published","")
+                if link:
+                    st.markdown(f"- [{title}]({link}) — {src} {('· ' + pub) if pub else ''}")
+                else:
+                    st.markdown(f"- {title} — {src} {('· ' + pub) if pub else ''}")
+        else:
+            st.caption("No recent injury-related headlines found for this matchup right now.")
+
     with st.expander("What changed from V2.2?"):
         st.markdown(
             """
-            - **Current injuries:** ESPN's live injury report now fills the same OUT / DOUBTFUL / QUESTIONABLE and position-group fields used in historical training.
+            - **Current injuries:** free consensus from **NFL.com official reports + ESPN + Sleeper** fills the same OUT / DOUBTFUL / QUESTIONABLE and position-group fields used in historical training. NFL.com is preferred when available.
             - **Spread margin calibration:** V2.3 keeps **55%** of V2.2's correction away from the market line. This reduced 2021–2025 walk-forward spread MAE from about **9.67 to 9.58** points; the closing market was about **9.76**.
             - **Spread probability calibration:** cover probabilities are compressed toward 50% to reduce overconfidence.
             - **Moneyline calibration:** **90% V2.2 probability + 10% de-vigged market probability**. Historical Brier score improved slightly from about **0.20384 to 0.20372**; the market was about **0.21155**.
