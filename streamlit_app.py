@@ -730,6 +730,222 @@ def fmt_odds(x):
     x = round(float(x))
     return f"+{x}" if x > 0 else str(x)
 
+
+# -----------------------------
+# Weekly model favorites
+# -----------------------------
+def _weekly_reference_market(book_rows, game_row):
+    """Use DraftKings when available; otherwise the most complete live book, then nflverse fallbacks."""
+    row = None
+    if book_rows:
+        core = [
+            "total", "over", "under", "home_spread",
+            "home_spread_odds", "away_spread_odds", "home_ml", "away_ml"
+        ]
+        # Prefer the most complete market snapshot. DraftKings wins ties so the
+        # weekly board generally matches the single-game app's default book.
+        candidates = sorted(
+            book_rows,
+            key=lambda r: (sum(r.get(k) is not None for k in core), 1 if r.get("key") == "draftkings" else 0),
+            reverse=True,
+        )
+        row = dict(candidates[0]) if candidates else None
+
+    fallback_total = to_float(game_row.get("total_line"), 44.5)
+    fallback_spread = -to_float(game_row.get("spread_line"), 0.0)
+    fallback_home_ml = to_float(game_row.get("home_moneyline"), None)
+    fallback_away_ml = to_float(game_row.get("away_moneyline"), None)
+    out = {
+        "book": (row or {}).get("book", "nflverse / fallback"),
+        "total": (row or {}).get("total") if (row or {}).get("total") is not None else fallback_total,
+        "over": (row or {}).get("over") if (row or {}).get("over") is not None else -110.0,
+        "under": (row or {}).get("under") if (row or {}).get("under") is not None else -110.0,
+        "home_spread": (row or {}).get("home_spread") if (row or {}).get("home_spread") is not None else fallback_spread,
+        "home_spread_odds": (row or {}).get("home_spread_odds") if (row or {}).get("home_spread_odds") is not None else -110.0,
+        "away_spread_odds": (row or {}).get("away_spread_odds") if (row or {}).get("away_spread_odds") is not None else -110.0,
+        "home_ml": (row or {}).get("home_ml") if (row or {}).get("home_ml") is not None else fallback_home_ml,
+        "away_ml": (row or {}).get("away_ml") if (row or {}).get("away_ml") is not None else fallback_away_ml,
+    }
+    return out
+
+
+def _weekly_weather_inputs(game_row, home_team):
+    roof_type = "fixed" if home_team in FIXED_ROOF else "retractable" if home_team in RETRACTABLE_ROOF else "outdoor"
+    schedule_roof = str(game_row.get("roof") or "").lower()
+    if roof_type == "fixed":
+        return 70.0, 0.0, 1.0, "fixed roof"
+    if roof_type == "retractable" and schedule_roof in {"closed", "dome"}:
+        return 70.0, 0.0, 1.0, "closed roof"
+
+    temp, wind = 70.0, 5.0
+    label = "forecast fallback"
+    loc = WEATHER_COORDS.get(home_team)
+    if loc:
+        try:
+            lat, lon, venue_name = loc
+            wx = fetch_weather(lat, lon, venue_name, schedule_kickoff_utc(game_row).isoformat())
+            temp = float(wx["temperature"])
+            wind = float(wx["wind"])
+            label = "stadium forecast"
+        except Exception:
+            pass
+    return temp, wind, 0.0, label
+
+
+def build_weekly_favorites_board(
+    *, schedule, week_games, odds_events, prev_pbp, cur_pbp, prev_states, cur_states,
+    season, week, strict_mode, root
+):
+    """Rank picks by model confidence, not by EV. V2.4 handles sides; V1 handles totals."""
+    ml_rows, spread_rows, total_rows, skipped = [], [], [], []
+
+    for _, g in week_games.sort_values(["gameday", "gametime", "game_id"]).iterrows():
+        away_t, home_t = str(g["away_team"]), str(g["home_team"])
+        matchup = f"{away_t} @ {home_t}"
+        rows = book_market_rows(match_odds_event(odds_events, away_t, home_t)) if odds_events else []
+        mkt = _weekly_reference_market(rows, g)
+
+        # Side model requires moneyline prices for its calibrated ML probability.
+        if mkt["home_ml"] is None or mkt["away_ml"] is None:
+            skipped.append(f"{matchup} (moneyline unavailable)")
+            continue
+
+        ff, _ = matchup_features(away_t, home_t, prev_states, cur_states, strict=strict_mode)
+        if ff is None:
+            skipped.append(f"{matchup} (team ratings unavailable)")
+            continue
+
+        temp, wind, dome_i, weather_src = _weekly_weather_inputs(g, home_t)
+        away_rest_i = to_float(g.get("away_rest"), 7.0)
+        home_rest_i = to_float(g.get("home_rest"), 7.0)
+        short_rest_i = 1.0 if min(away_rest_i, home_rest_i) <= 5 else 0.0
+        try:
+            div_i = 1.0 if float(g.get("div_game")) == 1 else 0.0
+        except Exception:
+            div_i = 0.0
+        cold_i = 0.0 if dome_i == 1.0 else max(0.0, (40.0 - temp) / 10.0)
+        total_features = dict(ff)
+        total_features.update({
+            "Wind": float(wind), "Cold_Units": float(cold_i), "Dome": float(dome_i),
+            "Short_Rest": short_rest_i, "Div_Game": div_i,
+        })
+        total_res = model_output(
+            total_features, float(mkt["total"]), float(mkt["over"]), float(mkt["under"])
+        )
+
+        try:
+            side = build_side_prediction_v24(
+                root=root, schedule=schedule, game=g, prev_pbp=prev_pbp, cur_pbp=cur_pbp,
+                home=home_t, away=away_t, season=int(season), week=int(week),
+                market_total=float(mkt["total"]), over_odds=float(mkt["over"]), under_odds=float(mkt["under"]),
+                home_spread=float(mkt["home_spread"]),
+                home_spread_odds=float(mkt["home_spread_odds"]), away_spread_odds=float(mkt["away_spread_odds"]),
+                home_ml=float(mkt["home_ml"]), away_ml=float(mkt["away_ml"]), dome=float(dome_i),
+            )
+        except Exception as exc:
+            skipped.append(f"{matchup} (V2.4: {exc})")
+            continue
+
+        # Moneyline favorite = side with the larger V2.4 win probability. Rank is confidence only.
+        if float(side["p_home_win"]) >= 0.5:
+            ml_pick, ml_p, ml_price, ml_fair, ml_ev = home_t, float(side["p_home_win"]), mkt["home_ml"], side["fair_home_ml"], side["home_ml_ev"]
+        else:
+            ml_pick, ml_p, ml_price, ml_fair, ml_ev = away_t, float(side["p_away_win"]), mkt["away_ml"], side["fair_away_ml"], side["away_ml_ev"]
+        ml_rows.append({
+            "Matchup": matchup, "Pick": f"{ml_pick} ML", "Confidence": ml_p,
+            "Price": ml_price, "Fair": ml_fair, "EV": float(ml_ev),
+            "V2.4 margin": float(side["predicted_margin"]), "Book": mkt["book"],
+        })
+
+        # Spread favorite = side with the larger V2.4 cover probability.
+        if float(side["p_home_cover"]) >= 0.5:
+            sp_pick, sp_line, sp_p, sp_price, sp_ev = home_t, float(mkt["home_spread"]), float(side["p_home_cover"]), mkt["home_spread_odds"], side["home_spread_ev"]
+        else:
+            sp_pick, sp_line, sp_p, sp_price, sp_ev = away_t, -float(mkt["home_spread"]), float(side["p_away_cover"]), mkt["away_spread_odds"], side["away_spread_ev"]
+        market_home_margin = -float(mkt["home_spread"])
+        spread_rows.append({
+            "Matchup": matchup, "Pick": f"{sp_pick} {sp_line:+.1f}", "Confidence": sp_p,
+            "Price": sp_price, "EV": float(sp_ev), "Model margin edge": abs(float(side["predicted_margin"]) - market_home_margin),
+            "Book": mkt["book"],
+        })
+
+        # Totals favorite = higher V1 O/U probability. It is intentionally shown as experimental.
+        if float(total_res["p_over"]) >= 0.5:
+            tot_pick, tot_p, tot_price, tot_ev = "OVER", float(total_res["p_over"]), mkt["over"], total_res["over_ev"]
+        else:
+            tot_pick, tot_p, tot_price, tot_ev = "UNDER", float(total_res["p_under"]), mkt["under"], total_res["under_ev"]
+        total_rows.append({
+            "Matchup": matchup, "Pick": f"{tot_pick} {float(mkt['total']):.1f}", "Confidence": tot_p,
+            "Price": tot_price, "EV": float(tot_ev), "V1 model total": float(total_res["model_total"]),
+            "Model edge": abs(float(total_res["model_total"]) - float(mkt["total"])),
+            "Weather": weather_src, "Book": mkt["book"],
+        })
+
+    def top3(rows, secondary):
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        return df.sort_values(["Confidence", secondary], ascending=[False, False]).head(3).reset_index(drop=True)
+
+    return {
+        "ml": top3(ml_rows, "EV"),
+        "spread": top3(spread_rows, "Model margin edge"),
+        "total": top3(total_rows, "Model edge"),
+        "skipped": skipped,
+        "games_scanned": len(ml_rows),
+    }
+
+
+def render_weekly_favorites(board, week):
+    st.subheader(f"⭐ Weekly Model Favorites — Week {int(week)}")
+    st.caption(
+        "These are ranked by MODEL CONFIDENCE, not by expected value. Moneyline and spread use V2.4; totals use the experimental V1 totals model. "
+        "EV and prices are shown only as context, so a top-ranked pick can still be a bad price."
+    )
+    if not board or board.get("games_scanned", 0) == 0:
+        st.warning("No complete weekly board could be built from the currently available markets/data.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Games scanned", board.get("games_scanned", 0))
+    c2.metric("Side model", "V2.4")
+    c3.metric("Totals model", "V1 experimental")
+
+    def prep(df, kind):
+        if df is None or df.empty:
+            return df
+        z = df.copy()
+        z.insert(0, "Rank", range(1, len(z) + 1))
+        z["Confidence"] = z["Confidence"].map(lambda x: f"{float(x):.1%}")
+        if "EV" in z:
+            z["EV"] = z["EV"].map(lambda x: f"{float(x):+.1%}")
+        if "Price" in z:
+            z["Price"] = z["Price"].map(fmt_odds)
+        if "Fair" in z:
+            z["Fair"] = z["Fair"].map(fmt_odds)
+        if "V2.4 margin" in z:
+            z["V2.4 margin"] = z["V2.4 margin"].map(lambda x: f"{float(x):+.1f}")
+        if "Model margin edge" in z:
+            z["Model margin edge"] = z["Model margin edge"].map(lambda x: f"{float(x):.1f} pts")
+        if "V1 model total" in z:
+            z["V1 model total"] = z["V1 model total"].map(lambda x: f"{float(x):.1f}")
+        if "Model edge" in z:
+            z["Model edge"] = z["Model edge"].map(lambda x: f"{float(x):.1f} pts")
+        return z
+
+    st.markdown("#### Top 3 Moneylines")
+    st.dataframe(prep(board["ml"], "ml"), width="stretch", hide_index=True)
+    st.markdown("#### Top 3 Spreads")
+    st.dataframe(prep(board["spread"], "spread"), width="stretch", hide_index=True)
+    st.markdown("#### Top 3 Totals")
+    st.dataframe(prep(board["total"], "total"), width="stretch", hide_index=True)
+    st.warning("Totals are shown because you asked for them, but V1 totals lost 18.2% ROI in the 2025 out-of-sample backtest. Treat the totals list as R&D, not a validated betting recommendation.")
+
+    if board.get("skipped"):
+        with st.expander(f"Skipped / incomplete games ({len(board['skipped'])})"):
+            for x in board["skipped"]:
+                st.write("•", x)
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -1059,6 +1275,38 @@ all_features.update(
         "Div_Game": div_game,
     }
 )
+
+
+
+# -----------------------------
+# Weekly model favorites board
+# -----------------------------
+st.markdown("---")
+st.subheader("Weekly favorites scanner")
+st.caption("Builds the strongest three ML, spread and total opinions for the selected NFL week. This is a confidence ranking, not an EV ranking.")
+week_games = upcoming[(pd.to_numeric(upcoming["season"], errors="coerce") == season) & (pd.to_numeric(upcoming["week"], errors="coerce") == week)].copy()
+board_key = f"weekly_favorites_{season}_{week}"
+if st.button(f"Build / refresh Week {week} model favorites", type="primary", key=f"weekly_favorites_button_{season}_{week}"):
+    if not api_key:
+        st.warning("Add The Odds API key first so the weekly board can use current moneyline/spread/total markets.")
+    elif build_side_prediction_v24 is None:
+        st.warning(f"V2.4 is unavailable: {V24_SIDE_IMPORT_ERROR}")
+    else:
+        try:
+            with st.spinner(f"Scanning Week {week} games with V2.4 sides + V1 totals…"):
+                st.session_state[board_key] = build_weekly_favorites_board(
+                    schedule=schedule, week_games=week_games, odds_events=odds_events,
+                    prev_pbp=prev_pbp, cur_pbp=cur_pbp, prev_states=prev_states, cur_states=cur_states,
+                    season=season, week=week, strict_mode=strict_mode, root=ROOT,
+                )
+        except Exception as exc:
+            st.error(f"Weekly favorites scan failed: {exc}")
+
+if board_key in st.session_state:
+    render_weekly_favorites(st.session_state[board_key], week)
+else:
+    st.info("Click the button above after odds have loaded. The scan checks every game in the selected week and keeps the top three in each market.")
+st.markdown("---")
 
 # -----------------------------
 # Model result
