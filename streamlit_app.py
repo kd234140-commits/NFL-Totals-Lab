@@ -26,6 +26,14 @@ except Exception as _v23_exc:
     get_free_breaking_news = None
     V23_SIDE_IMPORT_ERROR = str(_v23_exc)
 
+try:
+    from v2_side_live_v24 import build_side_prediction_v24, resolve_head_referee
+    V24_SIDE_IMPORT_ERROR = None
+except Exception as _v24_exc:
+    build_side_prediction_v24 = None
+    resolve_head_referee = None
+    V24_SIDE_IMPORT_ERROR = str(_v24_exc)
+
 # -----------------------------
 # App configuration
 # -----------------------------
@@ -36,6 +44,7 @@ st.set_page_config(
 )
 
 ROOT = Path(__file__).resolve().parent
+FORWARD_TEST_FILE = ROOT / "v2_2026_forward_test_snapshot.csv"
 SCHEDULE_URL = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
 PBP_URL = "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{season}.csv.gz"
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
@@ -164,6 +173,120 @@ def load_model_files():
     return coefficients, holdout, historical
 
 COEF, HOLDOUT, HISTORICAL = load_model_files()
+
+@st.cache_data(show_spinner=False)
+def load_forward_test_snapshot() -> pd.DataFrame:
+    if not FORWARD_TEST_FILE.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(FORWARD_TEST_FILE)
+    for c in ["model_home_margin", "home_spread", "p_home_win", "p_home_cover", "verified_away_score", "verified_home_score"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def grade_forward_test(snapshot: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
+    if snapshot.empty:
+        return pd.DataFrame()
+    out = snapshot.copy()
+    live_cols = [c for c in ["game_id", "away_score", "home_score"] if c in schedule.columns]
+    if len(live_cols) == 3:
+        live = schedule[live_cols].drop_duplicates("game_id").copy()
+        live["away_score"] = pd.to_numeric(live["away_score"], errors="coerce")
+        live["home_score"] = pd.to_numeric(live["home_score"], errors="coerce")
+        out = out.merge(live, on="game_id", how="left", suffixes=("", "_live"))
+    else:
+        out["away_score"] = pd.NA
+        out["home_score"] = pd.NA
+
+    # Prefer live schedule results; verified Week 1 scores are a fallback in case
+    # the public schedule feed lags. Pending games remain pending.
+    out["final_away_score"] = pd.to_numeric(out.get("away_score"), errors="coerce")
+    out["final_home_score"] = pd.to_numeric(out.get("home_score"), errors="coerce")
+    if "verified_away_score" in out:
+        out["final_away_score"] = out["final_away_score"].fillna(pd.to_numeric(out["verified_away_score"], errors="coerce"))
+    if "verified_home_score" in out:
+        out["final_home_score"] = out["final_home_score"].fillna(pd.to_numeric(out["verified_home_score"], errors="coerce"))
+
+    out["completed"] = out["final_home_score"].notna() & out["final_away_score"].notna()
+    out["actual_home_margin"] = out["final_home_score"] - out["final_away_score"]
+    out["actual_home_ats_margin"] = out["actual_home_margin"] + out["home_spread"]
+    out["actual_home_cover"] = out["actual_home_ats_margin"] > 0
+    out["ats_push"] = out["actual_home_ats_margin"] == 0
+    out["model_home_ats_pick"] = out["p_home_cover"] > 0.5
+    out["ats_correct"] = out["completed"] & (~out["ats_push"]) & (out["model_home_ats_pick"] == out["actual_home_cover"])
+
+    out["actual_home_win"] = out["actual_home_margin"] > 0
+    out["model_home_su_pick"] = out["p_home_win"] > 0.5
+    out["su_correct"] = out["completed"] & (out["model_home_su_pick"] == out["actual_home_win"])
+    out["model_margin_abs_error"] = (out["model_home_margin"] - out["actual_home_margin"]).abs()
+    out["market_home_margin"] = -out["home_spread"]
+    out["market_margin_abs_error"] = (out["market_home_margin"] - out["actual_home_margin"]).abs()
+    out["brier"] = (out["p_home_win"] - out["actual_home_win"].astype(float)) ** 2
+
+    def _logloss(row):
+        if not bool(row.get("completed")):
+            return float("nan")
+        p = min(max(float(row["p_home_win"]), 1e-9), 1 - 1e-9)
+        y = 1.0 if bool(row["actual_home_win"]) else 0.0
+        return -(y * math.log(p) + (1 - y) * math.log(1 - p))
+    out["log_loss"] = out.apply(_logloss, axis=1)
+    return out
+
+
+def render_forward_test_panel(schedule: pd.DataFrame) -> None:
+    snap = load_forward_test_snapshot()
+    if snap.empty:
+        return
+    graded = grade_forward_test(snap, schedule)
+    done = graded[graded["completed"]].copy()
+    if done.empty:
+        return
+
+    nonpush = done[~done["ats_push"]]
+    ats_w = int(nonpush["ats_correct"].sum())
+    ats_l = int(len(nonpush) - ats_w)
+    ats_p = int(done["ats_push"].sum())
+    su_w = int(done["su_correct"].sum())
+    su_l = int(len(done) - su_w)
+
+    st.subheader("2026 Forward-Test Results")
+    st.caption(
+        "These are frozen pregame V2.2 predictions saved from the September 12 screenshots. "
+        "The Wednesday NE–SEA and Thursday SF–LA games are excluded because the forward-test app was deployed after they were played. "
+        "V2.3 and V2.4 were not persistently logged for every Week 1 game, so they are not backfilled after the fact."
+    )
+    a, b, c, d = st.columns(4)
+    a.metric("Completed test games", f"{len(done)}/{len(graded)}")
+    a2 = f"{ats_w}-{ats_l}" + (f"-{ats_p}" if ats_p else "")
+    b.metric("V2.2 ATS direction", a2, f"{(ats_w / max(1, len(nonpush))):.1%}")
+    c.metric("Straight-up direction", f"{su_w}-{su_l}", f"{(su_w / max(1, len(done))):.1%}")
+    d.metric("V2.2 margin MAE", f"{done['model_margin_abs_error'].mean():.2f} pts")
+
+    a, b, c, d = st.columns(4)
+    a.metric("Market-line margin MAE", f"{done['market_margin_abs_error'].mean():.2f} pts")
+    b.metric("V2.2 ML Brier", f"{done['brier'].mean():.4f}")
+    c.metric("V2.2 ML log loss", f"{done['log_loss'].mean():.4f}")
+    pending = graded[~graded["completed"]]
+    d.metric("Pending", ", ".join((pending["away"] + " @ " + pending["home"]).tolist()) if len(pending) else "None")
+
+    st.info(
+        "Do not retrain the estimator weights after one week. Week 1 game data should become Week 2 inputs, while V2.2/V2.3/V2.4 stay frozen so the 2026 forward test remains clean."
+    )
+
+    with st.expander("Week 1 game-by-game forward-test grading"):
+        t = graded.copy()
+        t["Matchup"] = t["away"] + " @ " + t["home"]
+        t["Final"] = t.apply(lambda r: f"{int(r['final_away_score'])}-{int(r['final_home_score'])}" if r["completed"] else "Pending", axis=1)
+        t["ATS pick"] = t.apply(lambda r: (r["home"] if r["model_home_ats_pick"] else r["away"]) + " ATS", axis=1)
+        t["ATS result"] = t.apply(lambda r: "Pending" if not r["completed"] else ("Push" if r["ats_push"] else ("W" if r["ats_correct"] else "L")), axis=1)
+        t["SU pick"] = t.apply(lambda r: r["home"] if r["model_home_su_pick"] else r["away"], axis=1)
+        t["SU result"] = t.apply(lambda r: "Pending" if not r["completed"] else ("W" if r["su_correct"] else "L"), axis=1)
+        show = t[["Matchup", "Final", "model_home_margin", "home_spread", "ATS pick", "ATS result", "SU pick", "SU result"]].rename(
+            columns={"model_home_margin": "V2.2 home margin", "home_spread": "Pregame home spread"}
+        )
+        st.dataframe(show, width="stretch", hide_index=True)
+        st.caption("ATS direction grades the side whose model cover probability was above 50%. This is not the same thing as ROI on every positive-EV price.")
 
 # -----------------------------
 # Network data loaders
@@ -637,12 +760,18 @@ with st.sidebar:
     )
     st.caption("Odds key is never written into the app files.")
 
+    if st.button("Refresh live NFL data", help="Clears cached schedule/PBP/odds/injury/referee data and reloads the latest public feeds."):
+        st.cache_data.clear()
+        st.rerun()
+
 try:
     with st.spinner("Loading NFL schedule…"):
         schedule = load_schedule()
 except Exception as exc:
     st.exception(exc)
     st.stop()
+
+render_forward_test_panel(schedule)
 
 upcoming = upcoming_schedule(schedule, days_ahead=12)
 if upcoming.empty:
@@ -857,6 +986,21 @@ try:
     with st.spinner(f"Loading {season-1} prior-season play-by-play…"):
         prev_pbp = load_pbp(season - 1)
 
+    # Freshness audit: Week 2+ predictions should consume every available game
+    # from earlier weeks, but never the selected/current week's outcomes.
+    pbp_week = pd.to_numeric(cur_pbp.get("week"), errors="coerce")
+    prior_mask = pbp_week.notna() & (pbp_week > 0) & (pbp_week < week)
+    prior_pbp = cur_pbp.loc[prior_mask].copy()
+    prior_teams = set(prior_pbp.get("posteam", pd.Series(dtype=str)).dropna().astype(str)) | set(prior_pbp.get("defteam", pd.Series(dtype=str)).dropna().astype(str))
+    latest_prior_week = int(pbp_week[prior_mask].max()) if prior_mask.any() else 0
+    if week >= 2:
+        if latest_prior_week >= week - 1 and len(prior_teams) >= 32:
+            st.success(f"Live-data refresh: Week {week-1} PBP is loaded for all 32 teams. Week {week} features now include those results.")
+        elif latest_prior_week >= 1:
+            st.warning(f"Live-data refresh: PBP is available through Week {latest_prior_week} for {len(prior_teams)}/32 teams. The remaining team feeds may still be waiting on a late game/provider update.")
+        else:
+            st.warning("Live-data refresh: current-season prior-week PBP has not populated yet. Use ‘Refresh live NFL data’ later before trusting Week 2+ estimates.")
+
     cur_metrics = aggregate_game_metrics(cur_pbp)
     prev_metrics = aggregate_game_metrics(prev_pbp)
 
@@ -951,6 +1095,154 @@ if result["signal"] != "PASS":
     )
 else:
     st.info("V1 filter says PASS.")
+
+# -----------------------------
+# V2.4 Challenger — head referee tracker + V2.3
+# -----------------------------
+st.subheader("V2.4 Challenger — Head Referee Layer")
+st.caption(
+    "V2.4 keeps V2.3 intact and adds a deliberately small head-referee overlay. The tracker uses only games completed "
+    "before the selected matchup, shrinks small samples toward neutral, and caps the referee adjustment at ±0.25 points. "
+    "Team/QB/injury inputs still update exactly as they do in V2.3."
+)
+
+v24_result = None
+v24_error = None
+auto_ref_info = {"referee": "", "source": "unavailable", "url": ""}
+if resolve_head_referee is not None:
+    try:
+        auto_ref_info = resolve_head_referee(
+            schedule=schedule,
+            game=game,
+            season=season,
+            week=week,
+            away=away,
+            home=home,
+        ) or auto_ref_info
+    except Exception:
+        pass
+
+auto_ref = str(auto_ref_info.get("referee", "") or "")
+ref_override = st.text_input(
+    "Head referee",
+    value=auto_ref,
+    help="Auto-detected from nflverse/Football Zebras when available. You can correct it manually if a late assignment changes.",
+    key=f"v24_ref_{season}_{week}_{away}_{home}",
+)
+ref_source = auto_ref_info.get("source", "unavailable")
+ref_url = auto_ref_info.get("url", "")
+if ref_url:
+    st.caption(f"Assignment source: {ref_source} · {ref_url}")
+else:
+    st.caption(f"Assignment source: {ref_source}")
+
+if build_side_prediction_v24 is None:
+    v24_error = f"V2.4 module could not load: {V24_SIDE_IMPORT_ERROR}"
+else:
+    try:
+        with st.spinner("Running V2.4 referee challenger…"):
+            v24_result = build_side_prediction_v24(
+                root=ROOT,
+                schedule=schedule,
+                game=game,
+                prev_pbp=prev_pbp,
+                cur_pbp=cur_pbp,
+                home=home,
+                away=away,
+                season=season,
+                week=week,
+                market_total=float(market_total),
+                over_odds=float(over_odds),
+                under_odds=float(under_odds),
+                home_spread=float(home_spread),
+                home_spread_odds=float(home_spread_odds),
+                away_spread_odds=float(away_spread_odds),
+                home_ml=float(home_ml),
+                away_ml=float(away_ml),
+                dome=float(dome),
+                referee_override=(ref_override.strip() if ref_override.strip() and ref_override.strip().casefold() != auto_ref.strip().casefold() else None),
+            )
+    except Exception as exc:
+        v24_error = str(exc)
+
+if v24_error:
+    st.error(f"V2.4 challenger could not run: {v24_error}")
+
+if v24_result:
+    margin = float(v24_result["predicted_margin"])
+    margin_label = f"{home} by {margin:.1f}" if margin >= 0 else f"{away} by {abs(margin):.1f}"
+    rtrack = v24_result.get("referee_tracker", {}) or {}
+    rassn = v24_result.get("referee_assignment", {}) or {}
+    ref_name = rassn.get("referee", "") or rtrack.get("referee", "") or "Not found"
+    ref_adj = float(v24_result.get("referee_adjustment_points", 0.0))
+
+    a, b, c, d = st.columns(4)
+    a.metric("V2.4 adjusted margin", margin_label)
+    b.metric("Head referee", ref_name)
+    c.metric("Referee adjustment", f"{ref_adj:+.2f} pts")
+    d.metric("Status", "2026 forward test")
+
+    st.markdown("##### Moneyline")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} V2.4 win probability", f"{v24_result['p_home_win']:.1%}")
+    b.metric(f"{home} ML EV", f"{v24_result['home_ml_ev']:+.1%}")
+    c.metric(f"{away} V2.4 win probability", f"{v24_result['p_away_win']:.1%}")
+    d.metric(f"{away} ML EV", f"{v24_result['away_ml_ev']:+.1%}")
+
+    st.markdown("##### Point spread")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} {home_spread:+.1f} cover probability", f"{v24_result['p_home_cover']:.1%}")
+    b.metric(f"{home} spread EV", f"{v24_result['home_spread_ev']:+.1%}")
+    c.metric(f"{away} {-home_spread:+.1f} cover probability", f"{v24_result['p_away_cover']:.1%}")
+    d.metric(f"{away} spread EV", f"{v24_result['away_spread_ev']:+.1%}")
+
+    with st.expander("Head referee tracker"):
+        if rtrack.get("available"):
+            def _ats_text(rec):
+                rec = rec or {}
+                return f"{rec.get('wins',0)}-{rec.get('losses',0)}-{rec.get('pushes',0)}"
+            def _ou_text(rec):
+                rec = rec or {}
+                return f"{rec.get('over',0)}-{rec.get('under',0)}-{rec.get('pushes',0)}"
+
+            a, b, c, d = st.columns(4)
+            a.metric("Career games tracked", int(rtrack.get("career_games", 0)))
+            b.metric("Last 3 seasons", int(rtrack.get("recent3_games", 0)))
+            c.metric("Current season before game", int(rtrack.get("current_season_games", 0)))
+            d.metric("Last 16 games", int(rtrack.get("last16_games", 0)))
+
+            role_label = rtrack.get("role_label", "Same market role")
+            a, b, c, d = st.columns(4)
+            a.metric(f"{role_label} ATS", _ats_text(rtrack.get("role_ats")))
+            b.metric("Career home-team ATS", _ats_text(rtrack.get("career_home_ats")))
+            c.metric("Last-16 home-team ATS", _ats_text(rtrack.get("last16_home_ats")))
+            d.metric("Career O/U/P", _ou_text(rtrack.get("career_ou")))
+
+            a, b, c = st.columns(3)
+            raw_role = rtrack.get("role_mean_ats_residual")
+            raw_last = rtrack.get("last16_mean_ats_residual")
+            signal = float(rtrack.get("signal_points", 0.0))
+            a.metric("Same-role avg ATS residual", "—" if raw_role is None or pd.isna(raw_role) else f"{float(raw_role):+.2f} pts")
+            b.metric("Last-16 avg ATS residual", "—" if raw_last is None or pd.isna(raw_last) else f"{float(raw_last):+.2f} pts")
+            c.metric("Shrunk referee signal", f"{signal:+.2f} pts")
+
+            st.caption(
+                "Positive ATS residual means home teams historically beat the closing spread by more points; negative means the away side did. "
+                "V2.4 combines career, same market-role, current-season and last-16 residuals with strong shrinkage, then caps the actual model move at ±0.25 points."
+            )
+        else:
+            st.warning(rtrack.get("reason", "Referee history unavailable, so V2.4 applies no referee adjustment."))
+
+        st.info(
+            "Development check only (not a new untouched validation): applying this small referee layer to the 2021–2025 V2.3 walk-forward predictions "
+            "changed margin MAE from about 9.580 to 9.578 and ATS side accuracy from about 55.36% to 55.79%. The difference is small, so 2026 forward results decide whether the layer stays."
+        )
+
+    if abs(ref_adj) < 0.01:
+        st.caption("The referee layer is neutral for this matchup, so V2.4 will be nearly identical to V2.3.")
+    else:
+        direction = home if ref_adj > 0 else away
+        st.caption(f"Referee layer leans slightly toward {direction}; the adjustment is intentionally limited to {abs(ref_adj):.2f} points.")
 
 # -----------------------------
 # V2.3 Challenger — live injuries + calibrated probabilities

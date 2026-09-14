@@ -1,0 +1,15 @@
+game_id,season,week,away,home,model_version,model_home_margin,home_spread,p_home_win,p_home_cover,screenshot,verified_away_score,verified_home_score,snapshot_date,snapshot_source
+2026_01_ATL_PIT,2026,1,ATL,PIT,V2.2,6.6,-5.5,0.697,0.534,Screenshot 2026-09-12 084218.png,13.0,20.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_BAL_IND,2026,1,BAL,IND,V2.2,-3.0,3.5,0.406,0.511,Screenshot 2026-09-12 084335.png,41.0,23.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_BUF_HOU,2026,1,BUF,HOU,V2.2,-2.3,1.5,0.428,0.474,Screenshot 2026-09-12 082031.png,36.0,31.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_CHI_CAR,2026,1,CHI,CAR,V2.2,-2.9,2.5,0.411,0.488,Screenshot 2026-09-12 082228.png,59.0,37.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_CLE_JAX,2026,1,CLE,JAX,V2.2,8.4,-8.5,0.746,0.498,Screenshot 2026-09-12 082352.png,10.0,34.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_NO_DET,2026,1,NO,DET,V2.2,3.4,-6.5,0.605,0.404,Screenshot 2026-09-12 082520.png,30.0,31.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_NYJ_TEN,2026,1,NYJ,TEN,V2.2,2.8,-1.5,0.586,0.54,Screenshot 2026-09-12 082815.png,23.0,10.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_TB_CIN,2026,1,TB,CIN,V2.2,3.0,-3.5,0.593,0.484,Screenshot 2026-09-12 082933.png,27.0,33.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_ARI_LAC,2026,1,ARI,LAC,V2.2,8.2,-9.5,0.741,0.461,Screenshot 2026-09-12 083118.png,26.0,14.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_GB_MIN,2026,1,GB,MIN,V2.2,5.0,-1.5,0.653,0.609,Screenshot 2026-09-12 083240.png,22.0,39.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_MIA_LV,2026,1,MIA,LV,V2.2,1.0,-3.0,0.532,0.439,Screenshot 2026-09-12 083352.png,13.0,27.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_WAS_PHI,2026,1,WAS,PHI,V2.2,4.9,-5.5,0.648,0.48,Screenshot 2026-09-12 083518.png,22.0,24.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_DAL_NYG,2026,1,DAL,NYG,V2.2,2.0,3.0,0.563,0.654,Screenshot 2026-09-12 083631.png,20.0,28.0,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
+2026_01_DEN_KC,2026,1,DEN,KC,V2.2,-1.3,-2.5,0.459,0.382,Screenshot 2026-09-12 083742.png,,,2026-09-12,User pregame screenshots; saved before Sunday/Monday kickoff
