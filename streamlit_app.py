@@ -343,6 +343,79 @@ def load_pbp(season: int) -> pd.DataFrame:
         raise RuntimeError(f"nflverse play-by-play is missing expected columns: {missing}")
     return df
 
+def _odds_api_usage_from_response(response) -> dict:
+    """Extract quota counters returned by The Odds API."""
+    def _as_int(name):
+        value = response.headers.get(name)
+        if value is None:
+            return None
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+    remaining = _as_int("x-requests-remaining")
+    used = _as_int("x-requests-used")
+    last = _as_int("x-requests-last")
+    limit = (remaining + used) if remaining is not None and used is not None else None
+    return {
+        "remaining": remaining,
+        "used": used,
+        "last": last,
+        "limit": limit,
+        "observed_at": datetime.now(timezone.utc).timestamp(),
+    }
+
+
+def remember_odds_api_usage(usage: dict | None):
+    """Keep the freshest quota observation in session state.
+
+    Cached API responses carry the timestamp from the original HTTP request, so an
+    old cached response cannot overwrite a newer quota reading from a prop scan.
+    """
+    if not usage or usage.get("remaining") is None:
+        return
+    current = st.session_state.get("odds_api_usage") or {}
+    if float(usage.get("observed_at") or 0) >= float(current.get("observed_at") or 0):
+        st.session_state["odds_api_usage"] = usage
+        if usage.get("last") is not None and int(usage.get("last") or 0) > 0:
+            st.session_state["odds_api_last_charged"] = int(usage["last"])
+
+
+def current_odds_api_usage() -> dict:
+    return dict(st.session_state.get("odds_api_usage") or {})
+
+
+def render_odds_api_credit_panel():
+    usage = current_odds_api_usage()
+    st.markdown("#### Odds API credits")
+    if not api_key:
+        st.caption("Add your Odds API key to see live quota usage.")
+        return
+    if usage.get("remaining") is None:
+        st.caption("Quota will appear after the first Odds API request.")
+        return
+
+    remaining = int(usage["remaining"])
+    used = int(usage.get("used") or 0)
+    limit = usage.get("limit")
+    last = usage.get("last")
+    last_charged = st.session_state.get("odds_api_last_charged")
+    if limit is not None and int(limit) > 0:
+        st.progress(min(1.0, max(0.0, remaining / int(limit))))
+        st.caption(f"**{remaining:,} remaining** · {used:,} used · {int(limit):,} quota")
+    else:
+        st.caption(f"**{remaining:,} remaining** · {used:,} used")
+    if last_charged is not None:
+        st.caption(f"Last charged request: **{int(last_charged):,} credit{'s' if int(last_charged) != 1 else ''}**")
+    elif last is not None:
+        st.caption(f"Last API request cost: **{int(last):,} credit{'s' if int(last) != 1 else ''}**")
+    if remaining <= 25:
+        st.error("Very low API quota — avoid broad player-prop scans.")
+    elif remaining <= 75:
+        st.warning("API quota is getting low. Prefer selected-game or fewer-market scans.")
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_odds(_api_key: str, _bookmakers_csv: str = ""):
     if not _api_key:
@@ -362,7 +435,7 @@ def fetch_odds(_api_key: str, _bookmakers_csv: str = ""):
     if r.status_code == 429:
         raise RuntimeError("The Odds API usage limit has been reached.")
     r.raise_for_status()
-    return r.json()
+    return r.json(), _odds_api_usage_from_response(r)
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_nfl_events(_api_key: str):
@@ -374,7 +447,7 @@ def fetch_nfl_events(_api_key: str):
     if r.status_code == 429:
         raise RuntimeError("The Odds API usage limit has been reached.")
     r.raise_for_status()
-    return r.json()
+    return r.json(), _odds_api_usage_from_response(r)
 
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_event_props(_api_key: str, event_id: str, markets_csv: str, bookmakers_csv: str):
@@ -394,13 +467,13 @@ def fetch_event_props(_api_key: str, event_id: str, markets_csv: str, bookmakers
     if r.status_code == 401:
         raise RuntimeError("The Odds API rejected the key.")
     if r.status_code == 404:
-        return {}
+        return {}, _odds_api_usage_from_response(r)
     if r.status_code == 422:
         raise RuntimeError("The Odds API rejected one of the requested prop markets/bookmakers. Try fewer markets or books.")
     if r.status_code == 429:
         raise RuntimeError("The Odds API usage limit has been reached.")
     r.raise_for_status()
-    return r.json()
+    return r.json(), _odds_api_usage_from_response(r)
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_weather(lat: float, lon: float, venue_name: str, kickoff_utc_iso: str):
@@ -1048,6 +1121,8 @@ with st.sidebar:
     if len(selected_book_keys) > 10:
         st.caption("More than 10 books increases The Odds API credit cost because each group of 10 counts like another region.")
 
+    odds_credit_panel = st.container(border=True)
+
     strict_mode = st.checkbox(
         "Strict V1 ratings",
         value=False,
@@ -1105,7 +1180,8 @@ odds_error = None
 if api_key:
     try:
         with st.spinner("Refreshing sportsbook odds…"):
-            odds_events = fetch_odds(api_key, bookmaker_csv)
+            odds_events, odds_usage = fetch_odds(api_key, bookmaker_csv)
+            remember_odds_api_usage(odds_usage)
         event = match_odds_event(odds_events, away, home)
         book_rows = book_market_rows(event)
     except Exception as exc:
@@ -1113,6 +1189,9 @@ if api_key:
 
 if odds_error:
     st.warning(f"Live odds unavailable: {odds_error}")
+
+with odds_credit_panel:
+    render_odds_api_credit_panel()
 
 st.subheader("Market")
 market_source = "Manual / nflverse snapshot"
@@ -1435,7 +1514,8 @@ else:
         prop_scan_key = f"prop_scan_{season}_{week}_{scope}_{','.join(chosen_prop_keys)}_{bookmaker_csv}"
         target_events = []
         try:
-            nfl_events = fetch_nfl_events(api_key)
+            nfl_events, events_usage = fetch_nfl_events(api_key)
+            remember_odds_api_usage(events_usage)
             if scope == "Selected game":
                 ev = match_odds_event(nfl_events, away, home)
                 if ev:
@@ -1450,33 +1530,49 @@ else:
 
         regions_equiv = max(1, math.ceil(max(1, len(selected_book_keys)) / 10))
         estimated_credits = len(target_events) * len(chosen_prop_keys) * regions_equiv
+        usage_now = current_odds_api_usage()
+        credits_remaining = usage_now.get("remaining")
+        remaining_after = None if credits_remaining is None else int(credits_remaining) - int(estimated_credits)
+
         st.caption(
             f"Maximum estimated prop-scan cost: about **{estimated_credits} API credits** "
             f"({len(target_events)} event(s) × {len(chosen_prop_keys)} markets × {regions_equiv} bookmaker group(s)). "
             "Actual cost can be lower when requested markets are unavailable."
         )
+        if credits_remaining is not None:
+            st.caption(
+                f"Current quota: **{int(credits_remaining):,} credits remaining** → "
+                f"approximately **{max(0, remaining_after):,} remaining after this scan** at the maximum estimated cost."
+            )
+            if estimated_credits > int(credits_remaining):
+                st.error("This scan's estimated maximum cost is greater than your remaining quota. Reduce games, markets or sportsbooks first.")
+            elif remaining_after < 50 or estimated_credits >= max(25, int(credits_remaining) * 0.25):
+                st.warning("This is a relatively expensive scan for your remaining quota. Consider fewer prop markets or the selected-game scope.")
 
-        if st.button("Scan player props", type="primary", key="scan_props"):
-            if not chosen_prop_keys:
-                st.warning("Choose at least one prop market.")
-            elif not target_events:
-                st.warning("No matching Odds API events were found for this scope.")
-            else:
-                payloads = []
-                errors = []
-                progress = st.progress(0.0)
-                for i, ev in enumerate(target_events, start=1):
-                    try:
-                        x = fetch_event_props(api_key, str(ev["id"]), ",".join(chosen_prop_keys), bookmaker_csv)
-                        if x:
-                            payloads.append(x)
-                    except Exception as exc:
-                        errors.append(f"{ev.get('away_team')} @ {ev.get('home_team')}: {exc}")
-                    progress.progress(i / max(1, len(target_events)))
-                progress.empty()
-                st.session_state[prop_scan_key] = {"payloads": payloads, "errors": errors}
-                # Keep latest scan available to the arb tab without another API call.
-                st.session_state["latest_prop_payloads"] = payloads
+        scan_disabled = bool(
+            not chosen_prop_keys
+            or not target_events
+            or (credits_remaining is not None and estimated_credits > int(credits_remaining))
+        )
+        if st.button("Scan player props", type="primary", key="scan_props", disabled=scan_disabled):
+            payloads = []
+            errors = []
+            progress = st.progress(0.0)
+            for i, ev in enumerate(target_events, start=1):
+                try:
+                    x, prop_usage = fetch_event_props(api_key, str(ev["id"]), ",".join(chosen_prop_keys), bookmaker_csv)
+                    remember_odds_api_usage(prop_usage)
+                    if x:
+                        payloads.append(x)
+                except Exception as exc:
+                    errors.append(f"{ev.get('away_team')} @ {ev.get('home_team')}: {exc}")
+                progress.progress(i / max(1, len(target_events)))
+            progress.empty()
+            st.session_state[prop_scan_key] = {"payloads": payloads, "errors": errors}
+            # Keep latest scan available to the arb tab without another API call.
+            st.session_state["latest_prop_payloads"] = payloads
+            # Rerun once so the sidebar immediately reflects the newest quota counters.
+            st.rerun()
 
         scan_state = st.session_state.get(prop_scan_key)
         if scan_state:
