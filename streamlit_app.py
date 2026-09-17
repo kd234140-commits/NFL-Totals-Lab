@@ -11,6 +11,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from market_scanner import (
+    CORE_PROP_MARKETS, PROP_MARKET_LABELS, combine_prop_payloads,
+    core_arbitrage_table, core_best_lines, core_middle_table,
+    prop_arbitrage_table, prop_value_table,
+)
+
 try:
     from v2_side_live import build_side_prediction
     V22_SIDE_IMPORT_ERROR = None
@@ -48,7 +54,28 @@ FORWARD_TEST_FILE = ROOT / "v2_2026_forward_test_snapshot.csv"
 SCHEDULE_URL = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
 PBP_URL = "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{season}.csv.gz"
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
+ODDS_EVENTS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+ODDS_EVENT_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/odds"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+BOOKMAKER_OPTIONS = {
+    "DraftKings": "draftkings",
+    "FanDuel": "fanduel",
+    "BetMGM": "betmgm",
+    "BetRivers": "betrivers",
+    "theScore Bet": "espnbet",
+    "Hard Rock Bet": "hardrockbet",
+    "betPARX": "betparx",
+    "Bally Bet": "ballybet",
+    "Caesars (plan dependent)": "williamhill_us",
+    "Fanatics (plan dependent)": "fanatics",
+    "BetOnline": "betonlineag",
+    "Bovada": "bovada",
+}
+DEFAULT_BOOKS = [
+    "DraftKings", "FanDuel", "BetMGM", "BetRivers",
+    "theScore Bet", "Hard Rock Bet", "betPARX", "Bally Bet",
+]
 
 # nflverse uses LA for the Rams.
 ODDS_NAME_TO_ABBR = {
@@ -317,18 +344,59 @@ def load_pbp(season: int) -> pd.DataFrame:
     return df
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_odds(_api_key: str):
+def fetch_odds(_api_key: str, _bookmakers_csv: str = ""):
     if not _api_key:
         return []
     params = {
         "apiKey": _api_key,
-        "regions": "us",
         "markets": "h2h,spreads,totals",
         "oddsFormat": "american",
     }
+    if _bookmakers_csv:
+        params["bookmakers"] = _bookmakers_csv
+    else:
+        params["regions"] = "us"
     r = requests.get(ODDS_URL, params=params, timeout=30)
     if r.status_code == 401:
         raise RuntimeError("The Odds API rejected the key. Check the key and try again.")
+    if r.status_code == 429:
+        raise RuntimeError("The Odds API usage limit has been reached.")
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_nfl_events(_api_key: str):
+    if not _api_key:
+        return []
+    r = requests.get(ODDS_EVENTS_URL, params={"apiKey": _api_key, "dateFormat": "iso"}, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError("The Odds API rejected the key.")
+    if r.status_code == 429:
+        raise RuntimeError("The Odds API usage limit has been reached.")
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_event_props(_api_key: str, event_id: str, markets_csv: str, bookmakers_csv: str):
+    if not _api_key or not event_id or not markets_csv:
+        return {}
+    params = {
+        "apiKey": _api_key,
+        "markets": markets_csv,
+        "oddsFormat": "american",
+    }
+    if bookmakers_csv:
+        params["bookmakers"] = bookmakers_csv
+    else:
+        params["regions"] = "us"
+    url = ODDS_EVENT_URL.format(event_id=event_id)
+    r = requests.get(url, params=params, timeout=40)
+    if r.status_code == 401:
+        raise RuntimeError("The Odds API rejected the key.")
+    if r.status_code == 404:
+        return {}
+    if r.status_code == 422:
+        raise RuntimeError("The Odds API rejected one of the requested prop markets/bookmakers. Try fewer markets or books.")
     if r.status_code == 429:
         raise RuntimeError("The Odds API usage limit has been reached.")
     r.raise_for_status()
@@ -969,6 +1037,17 @@ with st.sidebar:
     )
     api_key = entered_key.strip() or secret_key.strip()
 
+    selected_book_labels = st.multiselect(
+        "Sportsbooks to compare",
+        options=list(BOOKMAKER_OPTIONS.keys()),
+        default=DEFAULT_BOOKS,
+        help="These books are used for line shopping, player-prop consensus and arbitrage scans. Up to 10 selected bookmaker keys are billed like one region by The Odds API.",
+    )
+    selected_book_keys = [BOOKMAKER_OPTIONS[x] for x in selected_book_labels]
+    bookmaker_csv = ",".join(selected_book_keys)
+    if len(selected_book_keys) > 10:
+        st.caption("More than 10 books increases The Odds API credit cost because each group of 10 counts like another region.")
+
     strict_mode = st.checkbox(
         "Strict V1 ratings",
         value=False,
@@ -1026,7 +1105,7 @@ odds_error = None
 if api_key:
     try:
         with st.spinner("Refreshing sportsbook odds…"):
-            odds_events = fetch_odds(api_key)
+            odds_events = fetch_odds(api_key, bookmaker_csv)
         event = match_odds_event(odds_events, away, home)
         book_rows = book_market_rows(event)
     except Exception as exc:
@@ -1306,6 +1385,170 @@ if board_key in st.session_state:
     render_weekly_favorites(st.session_state[board_key], week)
 else:
     st.info("Click the button above after odds have loaded. The scan checks every game in the selected week and keeps the top three in each market.")
+
+st.markdown("---")
+st.subheader("💰 Multi-book line shop, player props & arbitrage")
+st.caption(
+    "Player-prop EV here is a **de-vigged market-consensus estimate**, not a trained player-prop prediction model yet. "
+    "The scanner compares the best offered price with other sportsbooks at the exact same player/market/line. "
+    "Arbitrage is math-only and does not depend on V2.4."
+)
+
+if not api_key:
+    st.info("Add The Odds API key to use multi-book player props and arbitrage scanning.")
+else:
+    tab_lines, tab_props, tab_arb = st.tabs(["Best lines", "Player prop value", "Arbitrage & middles"])
+
+    with tab_lines:
+        best_lines = core_best_lines(odds_events)
+        if best_lines.empty:
+            st.caption("No multi-book core markets are available from the selected sportsbooks right now.")
+        else:
+            selected_matchup_name = f"{ABBR_TO_ODDS_NAME.get(away, away)} @ {ABBR_TO_ODDS_NAME.get(home, home)}"
+            one = best_lines[best_lines["Matchup"].eq(selected_matchup_name)].copy()
+            if one.empty:
+                one = best_lines.copy()
+            if "Odds" in one:
+                one["Odds"] = one["Odds"].map(fmt_odds)
+            if "Line" in one:
+                one["Line"] = one["Line"].map(lambda x: "—" if pd.isna(x) else f"{float(x):+.1f}")
+            st.dataframe(one, width="stretch", hide_index=True)
+            st.caption("For spreads, the finder prioritizes the most favorable point, then the best price. For totals, Over prefers the lowest line and Under the highest line.")
+
+    with tab_props:
+        scope = st.radio("Prop scan scope", ["Selected game", f"Week {week}"], horizontal=True, key="prop_scope")
+        prop_label_to_key = {v: k for k, v in PROP_MARKET_LABELS.items() if k != "player_anytime_td"}
+        default_prop_labels = [PROP_MARKET_LABELS[k] for k in CORE_PROP_MARKETS if k in PROP_MARKET_LABELS]
+        chosen_prop_labels = st.multiselect(
+            "Player prop markets",
+            options=list(prop_label_to_key.keys()),
+            default=default_prop_labels,
+            key="prop_markets",
+        )
+        chosen_prop_keys = [prop_label_to_key[x] for x in chosen_prop_labels]
+        p1, p2, p3 = st.columns(3)
+        min_prop_ev = p1.number_input("Minimum displayed EV %", value=2.0, step=0.5, key="min_prop_ev") / 100.0
+        min_other_books = p2.selectbox("Minimum other consensus books", [1, 2, 3], index=0, key="prop_consensus_n")
+        max_prop_rows = p3.selectbox("Show top", [10, 20, 30, 50], index=1, key="prop_top_n")
+
+        # Find the Odds API event IDs without spending quota (events endpoint is free).
+        prop_scan_key = f"prop_scan_{season}_{week}_{scope}_{','.join(chosen_prop_keys)}_{bookmaker_csv}"
+        target_events = []
+        try:
+            nfl_events = fetch_nfl_events(api_key)
+            if scope == "Selected game":
+                ev = match_odds_event(nfl_events, away, home)
+                if ev:
+                    target_events = [ev]
+            else:
+                for _, wg in week_games.iterrows():
+                    ev = match_odds_event(nfl_events, str(wg["away_team"]), str(wg["home_team"]))
+                    if ev:
+                        target_events.append(ev)
+        except Exception as exc:
+            st.warning(f"Could not load event IDs: {exc}")
+
+        regions_equiv = max(1, math.ceil(max(1, len(selected_book_keys)) / 10))
+        estimated_credits = len(target_events) * len(chosen_prop_keys) * regions_equiv
+        st.caption(
+            f"Maximum estimated prop-scan cost: about **{estimated_credits} API credits** "
+            f"({len(target_events)} event(s) × {len(chosen_prop_keys)} markets × {regions_equiv} bookmaker group(s)). "
+            "Actual cost can be lower when requested markets are unavailable."
+        )
+
+        if st.button("Scan player props", type="primary", key="scan_props"):
+            if not chosen_prop_keys:
+                st.warning("Choose at least one prop market.")
+            elif not target_events:
+                st.warning("No matching Odds API events were found for this scope.")
+            else:
+                payloads = []
+                errors = []
+                progress = st.progress(0.0)
+                for i, ev in enumerate(target_events, start=1):
+                    try:
+                        x = fetch_event_props(api_key, str(ev["id"]), ",".join(chosen_prop_keys), bookmaker_csv)
+                        if x:
+                            payloads.append(x)
+                    except Exception as exc:
+                        errors.append(f"{ev.get('away_team')} @ {ev.get('home_team')}: {exc}")
+                    progress.progress(i / max(1, len(target_events)))
+                progress.empty()
+                st.session_state[prop_scan_key] = {"payloads": payloads, "errors": errors}
+                # Keep latest scan available to the arb tab without another API call.
+                st.session_state["latest_prop_payloads"] = payloads
+
+        scan_state = st.session_state.get(prop_scan_key)
+        if scan_state:
+            prop_values = prop_value_table(scan_state.get("payloads", []), minimum_other_books=min_other_books)
+            if prop_values.empty:
+                st.warning("No exact-line player props had enough other-book consensus to calculate fair EV.")
+            else:
+                prop_values = prop_values[prop_values["EV"] >= min_prop_ev].copy().head(int(max_prop_rows))
+                if prop_values.empty:
+                    st.info("No props cleared the selected EV threshold.")
+                else:
+                    show = prop_values[[
+                        "Matchup", "Player", "Market", "Side", "Line", "Odds", "Book",
+                        "Fair Prob", "Fair Odds", "EV", "Probability Edge", "Consensus Books"
+                    ]].copy()
+                    show["Odds"] = show["Odds"].map(fmt_odds)
+                    show["Fair Odds"] = show["Fair Odds"].map(fmt_odds)
+                    show["Fair Prob"] = show["Fair Prob"].map(lambda x: f"{float(x):.1%}")
+                    show["EV"] = show["EV"].map(lambda x: f"{float(x):+.1%}")
+                    show["Probability Edge"] = show["Probability Edge"].map(lambda x: f"{float(x):+.1%}")
+                    show["Line"] = show["Line"].map(lambda x: "—" if pd.isna(x) else f"{float(x):g}")
+                    st.dataframe(show, width="stretch", hide_index=True)
+                    st.warning("These are market-consensus value estimates, not independently backtested player projections. Verify the line is still available before betting.")
+            if scan_state.get("errors"):
+                with st.expander(f"Prop scan errors ({len(scan_state['errors'])})"):
+                    for e in scan_state["errors"]:
+                        st.write("•", e)
+        else:
+            st.info("Choose the scope and markets, then click **Scan player props**. Scans are cached for about 90 seconds to reduce API usage.")
+
+    with tab_arb:
+        a1, a2 = st.columns(2)
+        arb_stake = a1.number_input("Total stake for arb calculator ($)", min_value=1.0, value=100.0, step=25.0, key="arb_stake")
+        min_arb_roi = a2.number_input("Minimum guaranteed ROI %", min_value=0.0, value=0.0, step=0.1, key="arb_min_roi") / 100.0
+        core_arbs = core_arbitrage_table(odds_events, total_stake=arb_stake, min_roi=min_arb_roi)
+        st.markdown("#### True arbitrage — moneylines, spreads & totals")
+        if core_arbs.empty:
+            st.info("No true core-market arbitrage is visible across the selected books right now.")
+        else:
+            z = core_arbs.copy()
+            for c in ["Odds A", "Odds B"]:
+                z[c] = z[c].map(fmt_odds)
+            z["ROI"] = z["ROI"].map(lambda x: f"{float(x):.2%}")
+            for c in ["Stake A", "Stake B", "Guaranteed Payout", "Guaranteed Profit"]:
+                z[c] = z[c].map(lambda x: f"${float(x):,.2f}")
+            st.dataframe(z, width="stretch", hide_index=True)
+
+        payloads = st.session_state.get("latest_prop_payloads", [])
+        st.markdown("#### True arbitrage — player props")
+        if payloads:
+            parbs = prop_arbitrage_table(payloads, total_stake=arb_stake, min_roi=min_arb_roi)
+            if parbs.empty:
+                st.info("No true player-prop arbitrage was found in your latest prop scan.")
+            else:
+                z = parbs.copy()
+                for c in ["Odds A", "Odds B"]:
+                    z[c] = z[c].map(fmt_odds)
+                z["ROI"] = z["ROI"].map(lambda x: f"{float(x):.2%}")
+                for c in ["Stake A", "Stake B", "Guaranteed Payout", "Guaranteed Profit"]:
+                    z[c] = z[c].map(lambda x: f"${float(x):,.2f}")
+                st.dataframe(z, width="stretch", hide_index=True)
+        else:
+            st.caption("Run the Player Prop Value scan first; the arb scanner reuses that data so it does not spend API credits twice.")
+
+        st.markdown("#### Middles (not guaranteed arbitrage)")
+        middles = core_middle_table(odds_events)
+        if middles.empty:
+            st.caption("No useful spread/total line middles are visible across the selected books.")
+        else:
+            st.dataframe(middles, width="stretch", hide_index=True)
+        st.warning("Arbitrage opportunities can disappear within seconds, and books can limit/void stale or erroneous prices. Always verify both legs before placing either bet. Middles can lose and are not guaranteed-profit bets.")
+
 st.markdown("---")
 
 # -----------------------------
@@ -1799,7 +2042,7 @@ with st.expander("Data sources & refresh behavior"):
 - **V1 totals inputs:** calculated from nflverse play-by-play
 - **V2.2 spread/ML inputs:** nflverse play-by-play, weekly player/QB stats, ESPN QBR, Next Gen Stats, snap counts, depth charts, and live market prices when available
 - **Weather:** Open-Meteo stadium-area forecast (used by V1 totals; V2.2 side model was trained without observed game-weather leakage)
-- **Sportsbook totals / spreads / moneylines / prices:** The Odds API when a key is configured
+- **Sportsbook totals / spreads / moneylines / player props / multi-book prices:** The Odds API when a key is configured
 - **Fallback line:** nflverse schedule snapshot or manual override
 - Schedule refresh cache: ~30 minutes
 - Weather refresh cache: ~30 minutes
