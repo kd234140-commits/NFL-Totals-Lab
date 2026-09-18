@@ -454,3 +454,808 @@ def core_middle_table(odds_events) -> pd.DataFrame:
                                  "Bet A": f"{home} {hline:+.1f} ({int(a['Odds']):+d})", "Book A": a["Book"],
                                  "Bet B": f"{away} {aline:+.1f} ({int(b['Odds']):+d})", "Book B": b["Book"]})
     return pd.DataFrame(rows)
+
+# ============================================================================
+# Multi-sport Market Radar / anomaly detector
+# ============================================================================
+
+SPORT_KEYS = {
+    "NFL": "americanfootball_nfl",
+    "NBA": "basketball_nba",
+    "MLB": "baseball_mlb",
+    "NHL": "icehockey_nhl",
+}
+
+FUTURE_SPORT_KEYS = {
+    "NFL": "americanfootball_nfl_super_bowl_winner",
+    "NBA": "basketball_nba_championship_winner",
+    "MLB": "baseball_mlb_world_series_winner",
+    "NHL": "icehockey_nhl_championship_winner",
+}
+
+EXCHANGE_BOOK_KEYS = {"novig", "kalshi", "polymarket", "prophetx"}
+
+# Curated current The Odds API market keys. The scanner is intentionally split
+# into core/deep/alternate presets so a free 500-credit plan can be conserved.
+SPORT_PROP_MARKETS = {
+    "NFL": {
+        "player_pass_yds": "Passing yards",
+        "player_pass_tds": "Passing TDs",
+        "player_pass_completions": "Pass completions",
+        "player_pass_attempts": "Pass attempts",
+        "player_pass_interceptions": "Pass interceptions",
+        "player_pass_longest_completion": "Longest completion",
+        "player_pass_rush_yds": "Pass + rush yards",
+        "player_rush_yds": "Rushing yards",
+        "player_rush_attempts": "Rush attempts",
+        "player_rush_longest": "Longest rush",
+        "player_receptions": "Receptions",
+        "player_reception_yds": "Receiving yards",
+        "player_reception_longest": "Longest reception",
+        "player_reception_tds": "Receiving TDs",
+        "player_rush_reception_yds": "Rush + receiving yards",
+        "player_rush_tds": "Rushing TDs",
+        "player_anytime_td": "Anytime TD",
+        "player_1st_td": "First TD scorer",
+        "player_last_td": "Last TD scorer",
+    },
+    "NBA": {
+        "player_points": "Points",
+        "player_rebounds": "Rebounds",
+        "player_assists": "Assists",
+        "player_threes": "Three-pointers",
+        "player_blocks": "Blocks",
+        "player_steals": "Steals",
+        "player_blocks_steals": "Blocks + steals",
+        "player_turnovers": "Turnovers",
+        "player_points_rebounds_assists": "Points + rebounds + assists",
+        "player_points_rebounds": "Points + rebounds",
+        "player_points_assists": "Points + assists",
+        "player_rebounds_assists": "Rebounds + assists",
+        "player_field_goals": "Field goals",
+        "player_frees_made": "Free throws made",
+        "player_frees_attempts": "Free throws attempted",
+        "player_first_basket": "First basket scorer",
+        "player_double_double": "Double-double",
+        "player_triple_double": "Triple-double",
+    },
+    "MLB": {
+        "batter_home_runs": "Batter home runs",
+        "batter_hits": "Batter hits",
+        "batter_total_bases": "Batter total bases",
+        "batter_rbis": "Batter RBIs",
+        "batter_runs_scored": "Batter runs",
+        "batter_hits_runs_rbis": "Hits + runs + RBIs",
+        "batter_singles": "Batter singles",
+        "batter_doubles": "Batter doubles",
+        "batter_triples": "Batter triples",
+        "batter_walks": "Batter walks",
+        "batter_strikeouts": "Batter strikeouts",
+        "batter_stolen_bases": "Batter stolen bases",
+        "pitcher_strikeouts": "Pitcher strikeouts",
+        "pitcher_record_a_win": "Pitcher to record a win",
+        "pitcher_hits_allowed": "Pitcher hits allowed",
+        "pitcher_walks": "Pitcher walks",
+        "pitcher_earned_runs": "Pitcher earned runs",
+        "pitcher_outs": "Pitcher outs",
+    },
+    "NHL": {
+        "player_points": "Points",
+        "player_power_play_points": "Power-play points",
+        "player_assists": "Assists",
+        "player_blocked_shots": "Blocked shots",
+        "player_shots_on_goal": "Shots on goal",
+        "player_goals": "Goals",
+        "player_total_saves": "Goalie saves",
+        "player_goal_scorer_first": "First goal scorer",
+        "player_goal_scorer_last": "Last goal scorer",
+        "player_goal_scorer_anytime": "Anytime goal scorer",
+    },
+}
+
+SPORT_CORE_PROP_KEYS = {
+    "NFL": [
+        "player_pass_yds", "player_pass_tds", "player_pass_completions",
+        "player_rush_yds", "player_rush_attempts", "player_receptions",
+        "player_reception_yds", "player_rush_reception_yds",
+    ],
+    "NBA": [
+        "player_points", "player_rebounds", "player_assists", "player_threes",
+        "player_points_rebounds_assists",
+    ],
+    "MLB": [
+        "batter_hits", "batter_total_bases", "batter_rbis", "batter_runs_scored",
+        "batter_home_runs", "pitcher_strikeouts", "pitcher_outs",
+    ],
+    "NHL": [
+        "player_shots_on_goal", "player_points", "player_assists",
+        "player_total_saves", "player_goals",
+    ],
+}
+
+SPORT_ALTERNATE_KEYS = {
+    "NFL": [
+        "player_pass_yds_alternate", "player_pass_tds_alternate",
+        "player_rush_yds_alternate", "player_receptions_alternate",
+        "player_reception_yds_alternate", "player_rush_reception_yds_alternate",
+    ],
+    "NBA": [
+        "player_points_alternate", "player_rebounds_alternate",
+        "player_assists_alternate", "player_threes_alternate",
+        "player_points_rebounds_assists_alternate",
+    ],
+    "MLB": [
+        "batter_hits_alternate", "batter_total_bases_alternate",
+        "batter_home_runs_alternate", "batter_rbis_alternate",
+        "pitcher_strikeouts_alternate", "pitcher_outs_alternate",
+    ],
+    "NHL": [
+        "player_points_alternate", "player_assists_alternate",
+        "player_goals_alternate", "player_shots_on_goal_alternate",
+        "player_total_saves_alternate",
+    ],
+}
+
+EXTRA_GAME_MARKETS = {
+    "NFL": ["team_totals"],
+    "NBA": ["team_totals", "h2h_h1", "spreads_h1", "totals_h1"],
+    "MLB": ["h2h_1st_5_innings", "spreads_1st_5_innings", "totals_1st_5_innings"],
+    "NHL": ["h2h_p1", "spreads_p1", "totals_p1"],
+}
+
+GENERIC_MARKET_LABELS = {
+    "h2h": "Moneyline",
+    "spreads": "Spread",
+    "totals": "Game total",
+    "alternate_spreads": "Alternate spread",
+    "alternate_totals": "Alternate total",
+    "team_totals": "Team total",
+    "alternate_team_totals": "Alternate team total",
+    "h2h_h1": "1st half moneyline",
+    "spreads_h1": "1st half spread",
+    "totals_h1": "1st half total",
+    "h2h_1st_5_innings": "First 5 moneyline",
+    "spreads_1st_5_innings": "First 5 run line",
+    "totals_1st_5_innings": "First 5 total",
+    "h2h_p1": "1st period moneyline",
+    "spreads_p1": "1st period puck line",
+    "totals_p1": "1st period total",
+    "outrights": "Championship future",
+}
+for _sport, _mkts in SPORT_PROP_MARKETS.items():
+    GENERIC_MARKET_LABELS.update(_mkts)
+for _sport, _keys in SPORT_ALTERNATE_KEYS.items():
+    for _key in _keys:
+        _base = _key.replace("_alternate", "")
+        GENERIC_MARKET_LABELS[_key] = "Alternate " + GENERIC_MARKET_LABELS.get(_base, _base.replace("_", " "))
+
+
+def market_label(market_key: str) -> str:
+    return GENERIC_MARKET_LABELS.get(str(market_key), str(market_key).replace("_", " ").title())
+
+
+def _num(value):
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def _best_link(outcome, market, bookmaker):
+    return outcome.get("link") or market.get("link") or bookmaker.get("link") or ""
+
+
+def _bet_limit(outcome):
+    # The exact field can vary by provider/market; keep this permissive.
+    for key in ("bet_limit", "betLimit", "max_bet", "maxBet", "limit"):
+        if key in outcome:
+            x = _num(outcome.get(key))
+            if x is not None:
+                return x
+    return None
+
+
+def normalize_market_payloads(payloads, sport_label: str | None = None) -> pd.DataFrame:
+    """Normalize featured, event-prop and outright responses into one offer table."""
+    if payloads is None:
+        return pd.DataFrame()
+    if isinstance(payloads, dict):
+        payloads = [payloads]
+    rows = []
+    for event in payloads or []:
+        if not isinstance(event, dict):
+            continue
+        sport = sport_label or event.get("sport_title") or event.get("sport_key") or ""
+        home, away = event.get("home_team"), event.get("away_team")
+        matchup = f"{away} @ {home}" if away and home else (event.get("sport_title") or sport or "Futures")
+        for b in event.get("bookmakers", []) or []:
+            bkey = str(b.get("key") or "")
+            bname = str(b.get("title") or bkey)
+            for m in b.get("markets", []) or []:
+                mkey = str(m.get("key") or "")
+                mlabel = market_label(mkey)
+                updated = m.get("last_update") or b.get("last_update")
+                for o in m.get("outcomes", []) or []:
+                    odds = _num(o.get("price"))
+                    if odds is None:
+                        continue
+                    line = _num(o.get("point"))
+                    side = str(o.get("name") or "")
+                    description = str(o.get("description") or "").strip()
+                    if mkey == "outrights":
+                        subject = "Championship"
+                    elif description:
+                        subject = description
+                    else:
+                        subject = "Game"
+                    rows.append({
+                        "Sport": sport,
+                        "Sport Key": event.get("sport_key"),
+                        "Event ID": event.get("id"),
+                        "Matchup": matchup,
+                        "Commence": event.get("commence_time"),
+                        "Home": home,
+                        "Away": away,
+                        "Market Key": mkey,
+                        "Market": mlabel,
+                        "Subject": subject,
+                        "Side": side,
+                        "Line": line,
+                        "Odds": odds,
+                        "Book Key": bkey,
+                        "Book": bname,
+                        "Exchange": bkey in EXCHANGE_BOOK_KEYS,
+                        "Updated": updated,
+                        "Link": _best_link(o, m, b),
+                        "Bet Limit": _bet_limit(o),
+                    })
+    return pd.DataFrame(rows)
+
+
+def combine_normalized_offer_frames(frames) -> pd.DataFrame:
+    good = [x for x in (frames or []) if isinstance(x, pd.DataFrame) and not x.empty]
+    return pd.concat(good, ignore_index=True) if good else pd.DataFrame()
+
+
+def _fmt_line(x):
+    x = _num(x)
+    if x is None:
+        return ""
+    return f"{x:g}"
+
+
+def _fmt_odds_text(x):
+    x = _num(x)
+    if x is None:
+        return ""
+    return f"{int(round(x)):+d}"
+
+
+def _effective_decimal(row, exchange_fee_buffer: float = 0.0):
+    d = american_to_decimal(row.get("Odds"))
+    if d is None:
+        return None
+    fee = max(0.0, min(0.25, float(exchange_fee_buffer or 0.0)))
+    if bool(row.get("Exchange")) and fee > 0:
+        # Conservative generic buffer: haircut only the profit component. Actual fee
+        # schedules differ by exchange, so the UI labels this an approximation.
+        d = 1.0 + (d - 1.0) * (1.0 - fee)
+    return d
+
+
+def _best_offer_adjusted(rows, exchange_fee_buffer: float = 0.0):
+    """Return the row with the best payout after the configured exchange-fee buffer."""
+    valid = []
+    for r in rows or []:
+        d = _effective_decimal(r, exchange_fee_buffer)
+        if d is not None:
+            valid.append((d, r))
+    if not valid:
+        return None
+    return max(valid, key=lambda x: x[0])[1]
+
+
+def _best_pair_adjusted(a_rows, b_rows, exchange_fee_buffer: float = 0.0):
+    combos = []
+    for a in a_rows:
+        da = _effective_decimal(a, exchange_fee_buffer)
+        if da is None:
+            continue
+        for b in b_rows:
+            if a.get("Book Key") == b.get("Book Key"):
+                continue
+            db = _effective_decimal(b, exchange_fee_buffer)
+            if db is None:
+                continue
+            combos.append((1.0 / da + 1.0 / db, a, b, da, db))
+    if not combos:
+        return None
+    return min(combos, key=lambda x: x[0])
+
+
+def _arb_math_effective(a, b, total_stake=100.0, exchange_fee_buffer: float = 0.0):
+    da = _effective_decimal(a, exchange_fee_buffer)
+    db = _effective_decimal(b, exchange_fee_buffer)
+    if da is None or db is None:
+        return None
+    inv = 1.0 / da + 1.0 / db
+    if inv <= 0:
+        return None
+    stake_a = float(total_stake) * (1.0 / da) / inv
+    stake_b = float(total_stake) * (1.0 / db) / inv
+    payout = float(total_stake) / inv
+    return {
+        "Implied Sum": inv,
+        "ROI": 1.0 / inv - 1.0,
+        "Stake A": stake_a,
+        "Stake B": stake_b,
+        "Guaranteed Payout": payout,
+        "Guaranteed Profit": payout - float(total_stake),
+    }
+
+
+def _arb_edge_label(roi, rows, exchange_fee_buffer: float = 0.0):
+    exchange_involved = any(bool(r.get("Exchange")) for r in rows if isinstance(r, dict))
+    if exchange_involved and float(exchange_fee_buffer or 0.0) > 0:
+        return f"{roi:.2%} fee-buffered arb"
+    if exchange_involved:
+        return f"{roi:.2%} before exchange fees"
+    return f"{roi:.2%} theoretical arb"
+
+
+def _arb_profit_word(rows, exchange_fee_buffer: float = 0.0):
+    exchange_involved = any(bool(r.get("Exchange")) for r in rows if isinstance(r, dict))
+    if exchange_involved and float(exchange_fee_buffer or 0.0) > 0:
+        return "estimated locked profit after the configured fee buffer"
+    if exchange_involved:
+        return "estimated locked profit before exchange fees"
+    return "theoretical locked profit"
+
+
+def _selection_text(row):
+    subject = str(row.get("Subject") or "")
+    side = str(row.get("Side") or "")
+    line = _num(row.get("Line"))
+    mkey = str(row.get("Market Key") or "")
+    if subject and subject not in {"Game", "Championship"}:
+        prefix = f"{subject} "
+    else:
+        prefix = ""
+    if line is not None and (side.lower() in {"over", "under"} or mkey.startswith("spreads") or "spread" in mkey):
+        if side.lower() in {"over", "under"}:
+            return f"{prefix}{side} {line:g}".strip()
+        return f"{prefix}{side} {line:+g}".strip()
+    return f"{prefix}{side}".strip()
+
+
+def _opp_row(*, score, kind, row, pick, compare, edge, why, book=None, odds=None, book2=None, odds2=None,
+             line_adv=None, payout_adv=None, arb_roi=None, middle_width=None, details=""):
+    return {
+        "Score": round(float(max(0, min(100, score))), 1),
+        "Type": kind,
+        "Sport": row.get("Sport", ""),
+        "Matchup": row.get("Matchup", ""),
+        "Commence": row.get("Commence"),
+        "Market": row.get("Market", market_label(row.get("Market Key", ""))),
+        "Market Key": row.get("Market Key", ""),
+        "Subject": row.get("Subject", ""),
+        "Pick": pick,
+        "Book": book if book is not None else row.get("Book", ""),
+        "Odds": odds if odds is not None else row.get("Odds"),
+        "Book 2": book2 or "",
+        "Odds 2": odds2,
+        "Compare": compare,
+        "Edge": edge,
+        "Why": why,
+        "Event ID": row.get("Event ID"),
+        "Line Advantage": line_adv,
+        "Payout Advantage": payout_adv,
+        "Arb ROI": arb_roi,
+        "Middle Width": middle_width,
+        "Link": row.get("Link", ""),
+        "Bet Limit": row.get("Bet Limit"),
+        "Details": details,
+    }
+
+
+def price_outlier_opportunities(offers: pd.DataFrame, min_payout_advantage: float = 0.015,
+                                min_books: int = 2, exchange_fee_buffer: float = 0.0) -> pd.DataFrame:
+    """Find a book paying materially more for the exact same selection/line."""
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    req = {"Event ID", "Market Key", "Subject", "Side", "Line", "Odds", "Book Key", "Book"}
+    if not req.issubset(offers.columns):
+        return pd.DataFrame()
+    rows = []
+    keys = ["Event ID", "Market Key", "Subject", "Side", "Line"]
+    for _, g in offers.groupby(keys, dropna=False):
+        # One best price per book for this exact selection.
+        book_rows = []
+        for _, bg in g.groupby("Book Key", dropna=False):
+            rr = _best_offer_adjusted(bg.to_dict("records"), exchange_fee_buffer)
+            if rr:
+                book_rows.append(rr)
+        if len(book_rows) < max(2, int(min_books)):
+            continue
+        candidate = _best_offer_adjusted(book_rows, exchange_fee_buffer)
+        if not candidate:
+            continue
+        cand_dec = _effective_decimal(candidate, exchange_fee_buffer)
+        others = [r for r in book_rows if r.get("Book Key") != candidate.get("Book Key")]
+        other_dec = sorted([_effective_decimal(r, exchange_fee_buffer) for r in others if _effective_decimal(r, exchange_fee_buffer)])
+        if cand_dec is None or not other_dec:
+            continue
+        median_dec = float(pd.Series(other_dec).median())
+        advantage = cand_dec / median_dec - 1.0
+        if advantage < float(min_payout_advantage):
+            continue
+        median_prob = 1.0 / median_dec
+        median_american = fair_american(median_prob)
+        exchange_gap = bool(candidate.get("Exchange")) or any(bool(r.get("Exchange")) for r in others)
+        kind = "EXCHANGE GAP" if exchange_gap else "PRICE OUTLIER"
+        score = 47 + min(43, advantage * 360) + min(6, max(0, len(book_rows) - 2) * 1.5)
+        pick = _selection_text(candidate)
+        compare = f"Other-book median {_fmt_odds_text(median_american)}"
+        edge = f"{advantage:+.1%} payout"
+        why = f"{candidate.get('Book')} is paying {_fmt_odds_text(candidate.get('Odds'))} for the exact same selection; the other-book median is about {_fmt_odds_text(median_american)}."
+        rows.append(_opp_row(
+            score=score, kind=kind, row=candidate, pick=pick, compare=compare, edge=edge, why=why,
+            payout_adv=advantage,
+        ))
+    return pd.DataFrame(rows)
+
+
+def _line_direction(market_key: str, side: str):
+    s = str(side).lower()
+    mk = str(market_key)
+    if s == "over":
+        return -1.0  # lower line is better
+    if s == "under":
+        return 1.0   # higher line is better
+    if "spread" in mk:
+        return 1.0   # more points is better for the selected team
+    return None
+
+
+def line_outlier_opportunities(offers: pd.DataFrame, min_line_advantage: float = 0.5,
+                               min_books: int = 2) -> pd.DataFrame:
+    """Find materially better main lines, even when there is no arbitrage."""
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    rows = []
+    gkeys = ["Event ID", "Market Key", "Subject", "Side"]
+    line_df = offers[offers["Line"].notna()].copy()
+    line_df = line_df[~line_df["Market Key"].astype(str).str.contains("alternate", case=False, na=False)]
+    for _, g in line_df.groupby(gkeys, dropna=False):
+        if g["Book Key"].nunique() < max(2, int(min_books)):
+            continue
+        direction = _line_direction(g.iloc[0]["Market Key"], g.iloc[0]["Side"])
+        if direction is None:
+            continue
+        # One representative line per book. If duplicates exist, choose the most favorable one.
+        reps = []
+        for _, bg in g.groupby("Book Key", dropna=False):
+            if direction > 0:
+                best_line = bg["Line"].max()
+            else:
+                best_line = bg["Line"].min()
+            rr = best_offer(bg[bg["Line"] == best_line].to_dict("records"))
+            if rr:
+                reps.append(rr)
+        if len(reps) < max(2, int(min_books)):
+            continue
+        # Candidate is the most favorable line; compare with other-book median.
+        candidate = max(reps, key=lambda r: direction * float(r["Line"]))
+        other_lines = [float(r["Line"]) for r in reps if r.get("Book Key") != candidate.get("Book Key")]
+        if not other_lines:
+            continue
+        median_line = float(pd.Series(other_lines).median())
+        advantage = direction * (float(candidate["Line"]) - median_line)
+        if advantage < float(min_line_advantage) - 1e-9:
+            continue
+        rel = advantage / max(1.0, abs(median_line))
+        score = 56 + min(28, rel * 320) + min(7, max(0, len(reps) - 2) * 1.4)
+        pick = _selection_text(candidate)
+        compare = f"Other-book median line {median_line:g}"
+        edge = f"{advantage:g} better line"
+        why = f"{candidate.get('Book')} has {pick}; the other selected books center around {median_line:g} for the same side."
+        rows.append(_opp_row(
+            score=score, kind="LINE OUTLIER", row=candidate, pick=pick, compare=compare, edge=edge, why=why,
+            line_adv=advantage,
+        ))
+    return pd.DataFrame(rows)
+
+
+def _best_two_side_pair(g: pd.DataFrame, side_a: str, side_b: str):
+    a = g[g["Side"].astype(str).str.lower().eq(str(side_a).lower())].to_dict("records")
+    b = g[g["Side"].astype(str).str.lower().eq(str(side_b).lower())].to_dict("records")
+    return _distinct_best_pair(a, b)
+
+
+def exact_arb_opportunities(offers: pd.DataFrame, total_stake: float = 100.0, exchange_fee_buffer: float = 0.0) -> pd.DataFrame:
+    """Find two-way arbs at the same line plus exact two-team moneylines."""
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    rows = []
+
+    # Over/Under and Yes/No exact-line arbs.
+    keys = ["Event ID", "Market Key", "Subject", "Line"]
+    for _, g in offers.groupby(keys, dropna=False):
+        side_l = {str(x).lower() for x in g["Side"].dropna().unique()}
+        pair_names = None
+        if {"over", "under"}.issubset(side_l):
+            pair_names = ("Over", "Under")
+        elif {"yes", "no"}.issubset(side_l):
+            pair_names = ("Yes", "No")
+        if not pair_names:
+            continue
+        a_rows = g[g["Side"].astype(str).str.lower().eq(pair_names[0].lower())].to_dict("records")
+        b_rows = g[g["Side"].astype(str).str.lower().eq(pair_names[1].lower())].to_dict("records")
+        pair = _best_pair_adjusted(a_rows, b_rows, exchange_fee_buffer)
+        if not pair or pair[0] >= 1.0:
+            continue
+        inv, a, b, _, _ = pair
+        calc = _arb_math_effective(a, b, total_stake, exchange_fee_buffer)
+        if not calc:
+            continue
+        roi = calc["ROI"]
+        score = 86 + min(14, roi * 900)
+        pa, pb = _selection_text(a), _selection_text(b)
+        edge = _arb_edge_label(roi, [a, b], exchange_fee_buffer)
+        why = f"{a['Book']} {pa} {_fmt_odds_text(a['Odds'])} + {b['Book']} {pb} {_fmt_odds_text(b['Odds'])} produce an implied sum below 100% after the configured exchange-fee buffer, when applicable."
+        details = f"${calc['Stake A']:.2f} on {pa}; ${calc['Stake B']:.2f} on {pb}; {_arb_profit_word([a,b], exchange_fee_buffer)} ≈ ${calc['Guaranteed Profit']:.2f} per ${float(total_stake):.2f}."
+        rows.append(_opp_row(
+            score=score, kind="TRUE ARB", row=a, pick=f"{pa} / {pb}",
+            compare=f"{a['Book']} ↔ {b['Book']}", edge=edge, why=why,
+            book=a["Book"], odds=a["Odds"], book2=b["Book"], odds2=b["Odds"], arb_roi=roi, details=details,
+        ))
+
+    # Two-team moneyline arbs (including period/inning 2-way h2h markets).
+    h = offers[offers["Market Key"].astype(str).str.startswith("h2h")].copy()
+    h = h[~h["Market Key"].astype(str).str.contains("3_way", na=False)]
+    for _, g in h.groupby(["Event ID", "Market Key"], dropna=False):
+        sides = [x for x in g["Side"].dropna().unique() if str(x).strip()]
+        if len(sides) != 2:
+            continue
+        a_rows = g[g["Side"].eq(sides[0])].to_dict("records")
+        b_rows = g[g["Side"].eq(sides[1])].to_dict("records")
+        pair = _best_pair_adjusted(a_rows, b_rows, exchange_fee_buffer)
+        if not pair or pair[0] >= 1.0:
+            continue
+        inv, a, b, _, _ = pair
+        calc = _arb_math_effective(a, b, total_stake, exchange_fee_buffer)
+        if not calc:
+            continue
+        roi = calc["ROI"]
+        score = 86 + min(14, roi * 900)
+        why = f"Best opposing prices are {a['Book']} {a['Side']} {_fmt_odds_text(a['Odds'])} and {b['Book']} {b['Side']} {_fmt_odds_text(b['Odds'])}."
+        details = f"${calc['Stake A']:.2f} on {a['Side']}; ${calc['Stake B']:.2f} on {b['Side']}; {_arb_profit_word([a,b], exchange_fee_buffer)} ≈ ${calc['Guaranteed Profit']:.2f} per ${float(total_stake):.2f}."
+        rows.append(_opp_row(
+            score=score, kind="TRUE ARB", row=a, pick=f"{a['Side']} / {b['Side']}",
+            compare=f"{a['Book']} ↔ {b['Book']}", edge=_arb_edge_label(roi, [a,b], exchange_fee_buffer), why=why,
+            book=a["Book"], odds=a["Odds"], book2=b["Book"], odds2=b["Odds"], arb_roi=roi, details=details,
+        ))
+
+    # Exact spread arbs: opposite teams at inverse lines.
+    s = offers[offers["Market Key"].astype(str).str.contains("spreads", na=False)].copy()
+    for (_, mk), g in s.groupby(["Event ID", "Market Key"], dropna=False):
+        sides = [x for x in g["Side"].dropna().unique() if str(x).strip()]
+        if len(sides) != 2:
+            continue
+        side_a, side_b = sides[0], sides[1]
+        for line in sorted(set(g[g["Side"].eq(side_a)]["Line"].dropna())):
+            ga = g[(g["Side"].eq(side_a)) & (g["Line"] == line)]
+            gb = g[(g["Side"].eq(side_b)) & (g["Line"] == -float(line))]
+            if ga.empty or gb.empty:
+                continue
+            pair = _best_pair_adjusted(ga.to_dict("records"), gb.to_dict("records"), exchange_fee_buffer)
+            if not pair or pair[0] >= 1.0:
+                continue
+            inv, a, b, _, _ = pair
+            calc = _arb_math_effective(a, b, total_stake, exchange_fee_buffer)
+            if not calc:
+                continue
+            roi = calc["ROI"]
+            score = 86 + min(14, roi * 900)
+            pa, pb = _selection_text(a), _selection_text(b)
+            rows.append(_opp_row(
+                score=score, kind="TRUE ARB", row=a, pick=f"{pa} / {pb}",
+                compare=f"{a['Book']} ↔ {b['Book']}", edge=_arb_edge_label(roi, [a,b], exchange_fee_buffer),
+                why=f"Opposite spread sides at the same effective line create an arb after the configured exchange-fee buffer, when applicable.",
+                book=a["Book"], odds=a["Odds"], book2=b["Book"], odds2=b["Odds"], arb_roi=roi,
+                details=f"${calc['Stake A']:.2f} on {pa}; ${calc['Stake B']:.2f} on {pb}; {_arb_profit_word([a,b], exchange_fee_buffer)} ≈ ${calc['Guaranteed Profit']:.2f} per ${float(total_stake):.2f}.",
+            ))
+    return pd.DataFrame(rows)
+
+
+def middle_opportunities(offers: pd.DataFrame, total_stake: float = 100.0, exchange_fee_buffer: float = 0.0) -> pd.DataFrame:
+    """Find favorable line gaps. A price-qualified middle can also be a true arb."""
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    rows = []
+    base = offers[~offers["Market Key"].astype(str).str.contains("alternate", case=False, na=False)].copy()
+
+    # Over/Under middles for totals, team totals and player props.
+    for _, g in base.groupby(["Event ID", "Market Key", "Subject"], dropna=False):
+        ov = g[g["Side"].astype(str).str.lower().eq("over") & g["Line"].notna()]
+        un = g[g["Side"].astype(str).str.lower().eq("under") & g["Line"].notna()]
+        if ov.empty or un.empty:
+            continue
+        lo, hi = float(ov["Line"].min()), float(un["Line"].max())
+        if lo >= hi:
+            continue
+        a = _best_offer_adjusted(ov[ov["Line"] == lo].to_dict("records"), exchange_fee_buffer)
+        b = _best_offer_adjusted(un[un["Line"] == hi].to_dict("records"), exchange_fee_buffer)
+        if not a or not b or a.get("Book Key") == b.get("Book Key"):
+            continue
+        width = hi - lo
+        da, db = _effective_decimal(a, exchange_fee_buffer), _effective_decimal(b, exchange_fee_buffer)
+        inv = (1.0 / da + 1.0 / db) if da and db else None
+        arb = inv is not None and inv < 1.0
+        roi = (1.0 / inv - 1.0) if arb else None
+        mid_rel = width / max(1.0, abs((lo + hi) / 2.0))
+        score = 64 + min(24, mid_rel * 380) + (10 if arb else 0)
+        pa, pb = _selection_text(a), _selection_text(b)
+        kind = "ARB + MIDDLE" if arb else "MIDDLE"
+        edge = f"{width:g} line window" + (f" · {_arb_edge_label(roi, [a,b], exchange_fee_buffer)}" if arb else "")
+        details = ""
+        if arb:
+            calc = _arb_math_effective(a, b, total_stake, exchange_fee_buffer)
+            if calc:
+                details = f"Outside the middle this prices as an arb after the configured fee buffer when applicable: ${calc['Stake A']:.2f} / ${calc['Stake B']:.2f}; ≈ ${calc['Guaranteed Profit']:.2f} profit per ${float(total_stake):.2f}. Inside the middle both bets can win."
+        rows.append(_opp_row(
+            score=score, kind=kind, row=a, pick=f"{pa} + {pb}",
+            compare=f"{a['Book']} ↔ {b['Book']}", edge=edge,
+            why=f"One book offers {pa} while another offers {pb}; the {lo:g}–{hi:g} gap can make both sides win in the middle.",
+            book=a["Book"], odds=a["Odds"], book2=b["Book"], odds2=b["Odds"],
+            arb_roi=roi, middle_width=width, details=details,
+        ))
+
+    # Spread middles.
+    spreads = base[base["Market Key"].astype(str).str.contains("spreads", na=False)].copy()
+    for _, g in spreads.groupby(["Event ID", "Market Key"], dropna=False):
+        sides = [x for x in g["Side"].dropna().unique() if str(x).strip()]
+        if len(sides) != 2:
+            continue
+        ga = g[g["Side"].eq(sides[0]) & g["Line"].notna()]
+        gb = g[g["Side"].eq(sides[1]) & g["Line"].notna()]
+        if ga.empty or gb.empty:
+            continue
+        la, lb = float(ga["Line"].max()), float(gb["Line"].max())
+        width = la + lb
+        if width <= 0:
+            continue
+        a = _best_offer_adjusted(ga[ga["Line"] == la].to_dict("records"), exchange_fee_buffer)
+        b = _best_offer_adjusted(gb[gb["Line"] == lb].to_dict("records"), exchange_fee_buffer)
+        if not a or not b or a.get("Book Key") == b.get("Book Key"):
+            continue
+        da, db = _effective_decimal(a, exchange_fee_buffer), _effective_decimal(b, exchange_fee_buffer)
+        inv = (1.0 / da + 1.0 / db) if da and db else None
+        arb = inv is not None and inv < 1.0
+        roi = (1.0 / inv - 1.0) if arb else None
+        score = 64 + min(24, width * 5.0) + (10 if arb else 0)
+        kind = "ARB + MIDDLE" if arb else "MIDDLE"
+        pa, pb = _selection_text(a), _selection_text(b)
+        details = ""
+        if arb:
+            calc = _arb_math_effective(a, b, total_stake, exchange_fee_buffer)
+            if calc:
+                details = f"Arb component after the configured fee buffer when applicable: ${calc['Stake A']:.2f} / ${calc['Stake B']:.2f}; ≈ ${calc['Guaranteed Profit']:.2f} profit per ${float(total_stake):.2f}."
+        rows.append(_opp_row(
+            score=score, kind=kind, row=a, pick=f"{pa} + {pb}",
+            compare=f"{a['Book']} ↔ {b['Book']}",
+            edge=f"{width:g}-point overlap" + (f" · {_arb_edge_label(roi, [a,b], exchange_fee_buffer)}" if arb else ""),
+            why=f"The two best spread numbers overlap by {width:g} points.",
+            book=a["Book"], odds=a["Odds"], book2=b["Book"], odds2=b["Odds"],
+            arb_roi=roi, middle_width=width, details=details,
+        ))
+    return pd.DataFrame(rows)
+
+
+def future_arb_opportunities(offers: pd.DataFrame, total_stake: float = 100.0, exchange_fee_buffer: float = 0.0) -> pd.DataFrame:
+    """Multi-outcome arb check for championship futures."""
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    f = offers[offers["Market Key"].eq("outrights")].copy()
+    if f.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, g in f.groupby(["Sport", "Event ID", "Market Key"], dropna=False):
+        bests = []
+        for outcome, og in g.groupby("Side", dropna=False):
+            rr = _best_offer_adjusted(og.to_dict("records"), exchange_fee_buffer)
+            if rr:
+                bests.append(rr)
+        if len(bests) < 2:
+            continue
+        inv = sum(1.0 / _effective_decimal(r, exchange_fee_buffer) for r in bests if _effective_decimal(r, exchange_fee_buffer))
+        if inv >= 1.0:
+            continue
+        roi = 1.0 / inv - 1.0
+        payout = float(total_stake) / inv
+        stakes = []
+        for r in bests:
+            d = _effective_decimal(r, exchange_fee_buffer)
+            stake = float(total_stake) * (1.0 / d) / inv
+            stakes.append(f"{r['Side']} {r['Book']} {_fmt_odds_text(r['Odds'])}: ${stake:.2f}")
+        first = bests[0]
+        rows.append(_opp_row(
+            score=88 + min(12, roi * 700), kind="TRUE ARB (FUTURE)", row=first,
+            pick=f"Cover all {len(bests)} outcomes", compare="Best price on each outcome",
+            edge=_arb_edge_label(roi, bests, exchange_fee_buffer),
+            why=f"The best available prices across all {len(bests)} listed outcomes sum to less than 100% implied probability after the configured exchange-fee buffer, when applicable.",
+            book="Multiple books", odds=None, arb_roi=roi,
+            details=" | ".join(stakes) + f" | Estimated locked payout ≈ ${payout:.2f} on ${float(total_stake):.2f} total stake under the configured fee assumptions.",
+        ))
+    return pd.DataFrame(rows)
+
+
+def build_opportunity_board(offers: pd.DataFrame, *, total_stake: float = 100.0,
+                            min_payout_advantage: float = 0.015,
+                            min_line_advantage: float = 0.5,
+                            min_books: int = 2,
+                            include_futures_arb: bool = True,
+                            exchange_fee_buffer: float = 0.0) -> pd.DataFrame:
+    """One ranked board: arbs, middles, line outliers, price outliers and exchange gaps."""
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    frames = [
+        exact_arb_opportunities(offers, total_stake=total_stake, exchange_fee_buffer=exchange_fee_buffer),
+        middle_opportunities(offers, total_stake=total_stake, exchange_fee_buffer=exchange_fee_buffer),
+        line_outlier_opportunities(offers, min_line_advantage=min_line_advantage, min_books=min_books),
+        price_outlier_opportunities(offers, min_payout_advantage=min_payout_advantage, min_books=min_books, exchange_fee_buffer=exchange_fee_buffer),
+    ]
+    if include_futures_arb:
+        frames.append(future_arb_opportunities(offers, total_stake=total_stake, exchange_fee_buffer=exchange_fee_buffer))
+    frames = [x for x in frames if isinstance(x, pd.DataFrame) and not x.empty]
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    # Remove exact duplicate detector outputs while preserving different opportunity types.
+    dedupe = ["Type", "Sport", "Event ID", "Market Key", "Subject", "Pick", "Book", "Book 2"]
+    present = [c for c in dedupe if c in out.columns]
+    out = out.sort_values(["Score", "Arb ROI", "Payout Advantage", "Line Advantage"],
+                          ascending=[False, False, False, False], na_position="last")
+    out = out.drop_duplicates(present, keep="first").reset_index(drop=True)
+    return out
+
+
+def apply_watchlist(opportunities: pd.DataFrame, terms) -> pd.DataFrame:
+    if opportunities is None or opportunities.empty:
+        return opportunities
+    terms = [str(x).strip().lower() for x in (terms or []) if str(x).strip()]
+    out = opportunities.copy()
+    if not terms:
+        out["Watch"] = False
+        return out
+    cols = [c for c in ["Sport", "Matchup", "Market", "Subject", "Pick", "Book", "Book 2", "Why"] if c in out.columns]
+    def hit(row):
+        text = " ".join(str(row.get(c, "")) for c in cols).lower()
+        for term in terms:
+            tokens = [t for t in term.replace("+", " ").split() if len(t) >= 2]
+            if tokens and all(t in text for t in tokens):
+                return True
+        return False
+    out["Watch"] = out.apply(hit, axis=1)
+    out = out.sort_values(["Watch", "Score"], ascending=[False, False]).reset_index(drop=True)
+    return out
+
+
+def book_coverage_summary(offers: pd.DataFrame, selected_book_keys=None) -> pd.DataFrame:
+    if offers is None or offers.empty:
+        return pd.DataFrame()
+    g = offers.groupby(["Book Key", "Book"], dropna=False).agg(
+        Offers=("Odds", "size"),
+        Events=("Event ID", "nunique"),
+        Markets=("Market Key", "nunique"),
+        Latest=("Updated", "max"),
+    ).reset_index()
+    if selected_book_keys:
+        wanted = pd.DataFrame({"Book Key": list(selected_book_keys)})
+        g = wanted.merge(g, on="Book Key", how="left")
+        g["Offers"] = g["Offers"].fillna(0).astype(int)
+        g["Events"] = g["Events"].fillna(0).astype(int)
+        g["Markets"] = g["Markets"].fillna(0).astype(int)
+        g["Book"] = g["Book"].fillna(g["Book Key"])
+    return g.sort_values(["Offers", "Book"], ascending=[False, True]).reset_index(drop=True)

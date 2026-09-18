@@ -15,6 +15,10 @@ from market_scanner import (
     CORE_PROP_MARKETS, PROP_MARKET_LABELS, combine_prop_payloads,
     core_arbitrage_table, core_best_lines, core_middle_table,
     prop_arbitrage_table, prop_value_table,
+    SPORT_KEYS, FUTURE_SPORT_KEYS, SPORT_PROP_MARKETS, SPORT_CORE_PROP_KEYS,
+    SPORT_ALTERNATE_KEYS, EXTRA_GAME_MARKETS, normalize_market_payloads,
+    combine_normalized_offer_frames, build_opportunity_board, apply_watchlist,
+    book_coverage_summary,
 )
 
 try:
@@ -44,7 +48,7 @@ except Exception as _v24_exc:
 # App configuration
 # -----------------------------
 st.set_page_config(
-    page_title="NFL Betting Lab — Auto Data",
+    page_title="Betting Lab + Market Radar",
     page_icon="🏈",
     layout="wide",
 )
@@ -63,18 +67,15 @@ BOOKMAKER_OPTIONS = {
     "FanDuel": "fanduel",
     "BetMGM": "betmgm",
     "BetRivers": "betrivers",
-    "theScore Bet": "espnbet",
-    "Hard Rock Bet": "hardrockbet",
-    "betPARX": "betparx",
-    "Bally Bet": "ballybet",
-    "Caesars (plan dependent)": "williamhill_us",
-    "Fanatics (plan dependent)": "fanatics",
-    "BetOnline": "betonlineag",
-    "Bovada": "bovada",
+    "Novig": "novig",
+    "Kalshi": "kalshi",
+    "Polymarket": "polymarket",
+    "ProphetX": "prophetx",
+    "Caesars (paid Odds API feed)": "williamhill_us",
 }
 DEFAULT_BOOKS = [
     "DraftKings", "FanDuel", "BetMGM", "BetRivers",
-    "theScore Bet", "Hard Rock Bet", "betPARX", "Bally Bet",
+    "Novig", "Kalshi", "Polymarket", "ProphetX",
 ]
 
 # nflverse uses LA for the Rams.
@@ -474,6 +475,108 @@ def fetch_event_props(_api_key: str, event_id: str, markets_csv: str, bookmakers
         raise RuntimeError("The Odds API usage limit has been reached.")
     r.raise_for_status()
     return r.json(), _odds_api_usage_from_response(r)
+
+# Generic multi-sport Odds API helpers used by Market Radar.
+ODDS_API_BASE = "https://api.the-odds-api.com/v4/sports"
+
+
+def _raise_market_api_error(r, context: str = "Odds API request"):
+    if r.status_code == 401:
+        raise RuntimeError("The Odds API rejected the key.")
+    if r.status_code == 422:
+        detail = ""
+        try:
+            detail = str((r.json() or {}).get("message") or "")
+        except Exception:
+            detail = r.text[:240] if getattr(r, "text", "") else ""
+        if "williamhill_us" in str(getattr(r.request, "url", "")):
+            detail = (detail + " Caesars is a paid-only Odds API bookmaker feed; turn Caesars off if you are on the free plan.").strip()
+        raise RuntimeError(f"{context} was rejected (422). {detail}".strip())
+    if r.status_code == 429:
+        raise RuntimeError("The Odds API usage limit has been reached.")
+    r.raise_for_status()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_sport_events(_api_key: str, sport_key: str):
+    if not _api_key:
+        return [], {}
+    url = f"{ODDS_API_BASE}/{sport_key}/events"
+    r = requests.get(url, params={"apiKey": _api_key, "dateFormat": "iso"}, timeout=30)
+    _raise_market_api_error(r, f"{sport_key} events request")
+    return r.json(), _odds_api_usage_from_response(r)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_sport_featured_odds(_api_key: str, sport_key: str, bookmakers_csv: str):
+    if not _api_key:
+        return [], {}
+    url = f"{ODDS_API_BASE}/{sport_key}/odds"
+    params = {
+        "apiKey": _api_key,
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "includeLinks": "true",
+        "includeBetLimits": "true",
+    }
+    if bookmakers_csv:
+        params["bookmakers"] = bookmakers_csv
+    else:
+        params["regions"] = "us"
+    r = requests.get(url, params=params, timeout=40)
+    _raise_market_api_error(r, f"{sport_key} featured odds request")
+    return r.json(), _odds_api_usage_from_response(r)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_sport_event_odds(_api_key: str, sport_key: str, event_id: str, markets_csv: str, bookmakers_csv: str):
+    if not _api_key or not event_id or not markets_csv:
+        return {}, {}
+    url = f"{ODDS_API_BASE}/{sport_key}/events/{event_id}/odds"
+    params = {
+        "apiKey": _api_key,
+        "markets": markets_csv,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "includeLinks": "true",
+        "includeBetLimits": "true",
+    }
+    if bookmakers_csv:
+        params["bookmakers"] = bookmakers_csv
+    else:
+        params["regions"] = "us"
+    r = requests.get(url, params=params, timeout=45)
+    if r.status_code == 404:
+        return {}, _odds_api_usage_from_response(r)
+    _raise_market_api_error(r, f"{sport_key} event odds request")
+    return r.json(), _odds_api_usage_from_response(r)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_futures_odds(_api_key: str, future_sport_key: str, bookmakers_csv: str):
+    if not _api_key:
+        return [], {}
+    url = f"{ODDS_API_BASE}/{future_sport_key}/odds"
+    params = {
+        "apiKey": _api_key,
+        "markets": "outrights",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "includeLinks": "true",
+        "includeBetLimits": "true",
+    }
+    if bookmakers_csv:
+        params["bookmakers"] = bookmakers_csv
+    else:
+        params["regions"] = "us"
+    r = requests.get(url, params=params, timeout=40)
+    # An out-of-season future may return 404 or an empty response; neither should break the board.
+    if r.status_code == 404:
+        return [], _odds_api_usage_from_response(r)
+    _raise_market_api_error(r, f"{future_sport_key} futures request")
+    return r.json(), _odds_api_usage_from_response(r)
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_weather(lat: float, lon: float, venue_name: str, kickoff_utc_iso: str):
@@ -1088,10 +1191,423 @@ def render_weekly_favorites(board, week):
                 st.write("•", x)
 
 # -----------------------------
+# Multi-sport Market Radar
+# -----------------------------
+def _parse_utc_timestamp(value):
+    try:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts
+    except Exception:
+        return None
+
+
+def _radar_target_events(events, horizon_hours: int, max_events: int):
+    now = pd.Timestamp.now(tz="UTC")
+    cutoff = now + pd.Timedelta(hours=int(horizon_hours))
+    good = []
+    for ev in events or []:
+        ts = _parse_utc_timestamp(ev.get("commence_time"))
+        if ts is None:
+            continue
+        # Keep live/recently-started games because some books still expose markets,
+        # but do not include events that began more than 3 hours ago.
+        if now - pd.Timedelta(hours=3) <= ts <= cutoff:
+            good.append(ev)
+    good.sort(key=lambda x: str(x.get("commence_time") or ""))
+    return good[: int(max_events)]
+
+
+def _radar_market_keys(league: str, scan_mode: str, include_extra: bool):
+    keys = []
+    if scan_mode != "Game lines only":
+        if scan_mode == "Smart props":
+            keys.extend(SPORT_CORE_PROP_KEYS.get(league, []))
+        else:
+            keys.extend(list(SPORT_PROP_MARKETS.get(league, {}).keys()))
+        if scan_mode == "Deep + alternates":
+            keys.extend(SPORT_ALTERNATE_KEYS.get(league, []))
+    if include_extra:
+        keys.extend(EXTRA_GAME_MARKETS.get(league, []))
+    # Preserve order, remove duplicates.
+    return list(dict.fromkeys(keys))
+
+
+def _split_watch_terms(text):
+    if not text:
+        return []
+    cleaned = str(text).replace(",", "\n")
+    return [x.strip() for x in cleaned.splitlines() if x.strip()]
+
+
+def _radar_type_icon(kind):
+    k = str(kind)
+    if k.startswith("TRUE ARB"):
+        return "🟢 " + k
+    if k == "ARB + MIDDLE":
+        return "🟢🟣 " + k
+    if k == "MIDDLE":
+        return "🟣 " + k
+    if k == "LINE OUTLIER":
+        return "🔵 " + k
+    if k == "EXCHANGE GAP":
+        return "🟡 " + k
+    if k == "PRICE OUTLIER":
+        return "🟠 " + k
+    return k
+
+
+def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
+    st.markdown("---")
+    st.subheader("🔎 Market Radar — automatic mispricing scanner")
+    st.caption(
+        "This is the Pikkit-style screen that does the scrolling for you. It scans only your selected books, then surfaces "
+        "true arbs, middles, unusually good lines, exact-price outliers and sportsbook-vs-exchange disagreements. "
+        "A flag is a market anomaly, not proof that a side will win."
+    )
+    with st.expander("What each flag means", expanded=False):
+        st.markdown(
+            "**TRUE ARB** — opposing prices mathematically lock a positive return under the displayed fee assumptions.  \n"
+            "**ARB + MIDDLE** — the prices form an arb and the line gap also creates a range where both bets can win.  \n"
+            "**MIDDLE** — favorable line gap, but not guaranteed profit; both bets can still lose outside the middle.  \n"
+            "**LINE OUTLIER** — one selected book gives a materially better number than the others.  \n"
+            "**PRICE OUTLIER** — the exact same selection/line pays materially more at one book.  \n"
+            "**EXCHANGE GAP** — the exact same selection is priced unusually differently between an exchange and the rest of your market."
+        )
+        st.caption("The 0–100 Mispricing Score ranks how unusual/useful the discrepancy looks. It is not a predicted win probability or EV estimate.")
+    st.info(
+        "Championship futures are supported when the feed has them. Team season-win totals (for example, Steelers O/U 8.5 wins) "
+        "are not currently a documented standard Odds API market, so this version does not pretend to scan those automatically yet."
+    )
+
+    if not api_key:
+        st.info("Add The Odds API key in the sidebar to use Market Radar.")
+        return
+    if not selected_book_keys:
+        st.info("Select at least two sportsbooks/exchanges in the sidebar.")
+        return
+
+    top_a, top_b, top_c, top_d = st.columns([1.1, 1.1, 1.1, 1.2])
+    leagues = top_a.multiselect(
+        "Leagues", ["NFL", "NBA", "MLB", "NHL"], default=["NFL", "NBA", "MLB", "NHL"], key="radar_leagues"
+    )
+    scan_mode = top_b.selectbox(
+        "Scan depth", ["Game lines only", "Smart props", "Deep props", "Deep + alternates"],
+        index=1, key="radar_depth",
+        help="Smart props scans the most useful props. Deep adds nearly every listed main player prop. Alternates can use many more credits."
+    )
+    horizon_label = top_c.selectbox(
+        "Games starting within", ["12 hours", "24 hours", "48 hours", "72 hours", "7 days"],
+        index=2, key="radar_horizon"
+    )
+    max_events = top_d.selectbox("Max events per league", [5, 10, 16, 20, 30], index=2, key="radar_max_events")
+    horizon_hours = {"12 hours": 12, "24 hours": 24, "48 hours": 48, "72 hours": 72, "7 days": 168}[horizon_label]
+
+    opt1, opt2, opt3, opt4, opt5 = st.columns(5)
+    include_extra = opt1.checkbox(
+        "Extra game markets", value=False, key="radar_extra",
+        help="Adds team totals / 1st half / first 5 innings / first period where supported. These are event-level markets and use extra credits."
+    )
+    include_futures = opt2.checkbox("Championship futures", value=True, key="radar_futures")
+    sensitivity = opt3.selectbox("Sensitivity", ["Very sensitive", "Balanced", "Strict"], index=0, key="radar_sensitivity")
+    arb_bankroll = opt4.number_input("Arb example stake ($)", min_value=10.0, value=100.0, step=25.0, key="radar_arb_stake")
+    exchange_fee_buffer = opt5.number_input(
+        "Exchange fee buffer %", min_value=0.0, max_value=10.0, value=1.0, step=0.25, key="radar_exchange_fee_buffer",
+        help="Conservative generic haircut on the profit portion of exchange prices when testing arbs/price gaps. Actual Novig/Kalshi/Polymarket/ProphetX fees and liquidity differ, so verify the executable price and fee before betting."
+    ) / 100.0
+
+    if sensitivity == "Very sensitive":
+        min_price_adv, min_line_adv = 0.010, 0.5
+    elif sensitivity == "Balanced":
+        min_price_adv, min_line_adv = 0.025, 0.5
+    else:
+        min_price_adv, min_line_adv = 0.050, 1.0
+
+    with st.expander("⭐ Sides / players I already like", expanded=False):
+        watch_text = st.text_area(
+            "One interest per line (or comma separated)",
+            value=st.session_state.get("radar_watch_text", ""),
+            placeholder="Josh Allen over\nSteelers\nPuka receiving over",
+            key="radar_watch_input",
+            help="These do not change the math. They only put a star on matching anomalies so a better number on a side you already like is easy to notice."
+        )
+        st.session_state["radar_watch_text"] = watch_text
+        st.caption("Example: `Josh Allen over` will prioritize matching Josh Allen Over opportunities without calling them +EV just because you like the side.")
+    watch_terms = _split_watch_terms(st.session_state.get("radar_watch_text", ""))
+
+    # Events are free to query, so use them to estimate the scan before the user spends credits.
+    target_events_by_league = {}
+    discovery_errors = []
+    for league in leagues:
+        try:
+            events, usage = fetch_sport_events(api_key, SPORT_KEYS[league])
+            remember_odds_api_usage(usage)
+            target_events_by_league[league] = _radar_target_events(events, horizon_hours, max_events)
+        except Exception as exc:
+            discovery_errors.append(f"{league}: {exc}")
+            target_events_by_league[league] = []
+
+    groups = max(1, math.ceil(max(1, len(selected_book_keys)) / 10))
+    featured_cost = len(leagues) * 3 * groups
+    event_cost = 0
+    event_calls = 0
+    for league in leagues:
+        event_markets = _radar_market_keys(league, scan_mode, include_extra)
+        n_events = len(target_events_by_league.get(league, []))
+        event_cost += n_events * len(event_markets) * groups
+        if event_markets:
+            event_calls += n_events
+    futures_cost = (len(leagues) * groups) if include_futures else 0
+    estimated_cost = featured_cost + event_cost + futures_cost
+
+    counts_text = " · ".join(f"{lg}: {len(target_events_by_league.get(lg, []))}" for lg in leagues) if leagues else "No leagues selected"
+    est_box = st.container(border=True)
+    with est_box:
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Events in scope", sum(len(v) for v in target_events_by_league.values()))
+        e2.metric("Max credit estimate", estimated_cost)
+        usage_now = current_odds_api_usage()
+        remaining = usage_now.get("remaining")
+        e3.metric("Credits remaining", f"{int(remaining):,}" if remaining is not None else "—")
+        e4.metric("Books selected", len(selected_book_keys))
+        st.caption(f"Events discovered: {counts_text}. Actual cost can be lower because The Odds API charges event calls for unique markets actually returned.")
+
+    if "williamhill_us" in selected_book_keys:
+        st.warning("Caesars is currently a paid-only feed in The Odds API. If you are on the free plan and a scan returns a 422 error, uncheck Caesars in the sidebar and rerun.")
+
+    if discovery_errors:
+        with st.expander(f"Event discovery warnings ({len(discovery_errors)})"):
+            for x in discovery_errors:
+                st.write("•", x)
+
+    expensive = estimated_cost >= 100
+    confirm_expensive = True
+    if expensive:
+        confirm_expensive = st.checkbox(
+            f"I understand this scan could use up to about {estimated_cost} credits",
+            value=False, key="radar_confirm_expensive"
+        )
+        st.warning("This is a broad scan. Reduce the horizon, leagues or scan depth if you want to conserve the free monthly quota.")
+
+    scan_disabled = (
+        not leagues
+        or len(selected_book_keys) < 2
+        or (remaining is not None and estimated_cost > int(remaining))
+        or not confirm_expensive
+    )
+    if remaining is not None and estimated_cost > int(remaining):
+        st.error("The estimated maximum scan cost is greater than your remaining API credits. Narrow the scan first.")
+
+    if st.button("🚨 Run Market Radar", type="primary", key="run_market_radar", disabled=scan_disabled):
+        offer_frames = []
+        errors = []
+        total_calls = len(leagues) + event_calls + (len(leagues) if include_futures else 0)
+        done_calls = 0
+        progress = st.progress(0.0, text="Scanning markets…")
+
+        for league in leagues:
+            sport_key = SPORT_KEYS[league]
+            try:
+                payload, usage = fetch_sport_featured_odds(api_key, sport_key, bookmaker_csv)
+                remember_odds_api_usage(usage)
+                frame = normalize_market_payloads(payload, league)
+                if not frame.empty:
+                    offer_frames.append(frame)
+            except Exception as exc:
+                errors.append(f"{league} game lines: {exc}")
+            done_calls += 1
+            progress.progress(done_calls / max(1, total_calls), text=f"{league}: game lines")
+
+            event_markets = _radar_market_keys(league, scan_mode, include_extra)
+            if event_markets:
+                market_csv = ",".join(event_markets)
+                for ev in target_events_by_league.get(league, []):
+                    try:
+                        payload, usage = fetch_sport_event_odds(api_key, sport_key, str(ev.get("id")), market_csv, bookmaker_csv)
+                        remember_odds_api_usage(usage)
+                        frame = normalize_market_payloads(payload, league)
+                        if not frame.empty:
+                            offer_frames.append(frame)
+                    except Exception as exc:
+                        errors.append(f"{league} {ev.get('away_team')} @ {ev.get('home_team')}: {exc}")
+                    done_calls += 1
+                    progress.progress(done_calls / max(1, total_calls), text=f"{league}: props / extra markets")
+
+            if include_futures:
+                try:
+                    payload, usage = fetch_futures_odds(api_key, FUTURE_SPORT_KEYS[league], bookmaker_csv)
+                    remember_odds_api_usage(usage)
+                    frame = normalize_market_payloads(payload, league)
+                    if not frame.empty:
+                        offer_frames.append(frame)
+                except Exception as exc:
+                    # Futures can simply be out of season; keep the error available but do not stop the scan.
+                    errors.append(f"{league} futures: {exc}")
+                done_calls += 1
+                progress.progress(done_calls / max(1, total_calls), text=f"{league}: futures")
+
+        progress.empty()
+        offers = combine_normalized_offer_frames(offer_frames)
+        board = build_opportunity_board(
+            offers,
+            total_stake=float(arb_bankroll),
+            min_payout_advantage=min_price_adv,
+            min_line_advantage=min_line_adv,
+            min_books=2,
+            include_futures_arb=include_futures,
+            exchange_fee_buffer=float(exchange_fee_buffer),
+        )
+        board = apply_watchlist(board, watch_terms)
+        st.session_state["market_radar_scan"] = {
+            "offers": offers,
+            "board": board,
+            "errors": errors,
+            "leagues": leagues,
+            "book_keys": list(selected_book_keys),
+            "estimated_cost": estimated_cost,
+            "scan_mode": scan_mode,
+            "horizon": horizon_label,
+            "exchange_fee_buffer": float(exchange_fee_buffer),
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+        }
+        st.rerun()
+
+    scan = st.session_state.get("market_radar_scan")
+    if not scan:
+        st.info("Run Market Radar and it will replace the giant odds list with a ranked board of only the unusual stuff.")
+        return
+
+    offers = scan.get("offers")
+    board = scan.get("board")
+    # Re-apply the live watchlist without spending API credits again.
+    board = apply_watchlist(board, watch_terms) if isinstance(board, pd.DataFrame) else pd.DataFrame()
+    scanned_at = scan.get("scanned_at")
+    try:
+        scan_et = pd.Timestamp(scanned_at).tz_convert("America/New_York").strftime("%b %-d, %-I:%M:%S %p ET")
+    except Exception:
+        scan_et = str(scanned_at or "")
+    st.caption(f"Last radar scan: **{scan_et}** · {scan.get('scan_mode')} · {scan.get('horizon')} horizon. Cached scans do not spend credits again until the API cache expires or inputs change.")
+
+    if board.empty:
+        st.info("No opportunities cleared the current sensitivity thresholds. That can be a good sign: the selected books are closely aligned right now.")
+    else:
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Flagged", len(board))
+        m2.metric("True arbs", int(board["Type"].astype(str).str.startswith("TRUE ARB").sum()) + int((board["Type"] == "ARB + MIDDLE").sum()))
+        m3.metric("Middles", int(board["Type"].isin(["MIDDLE", "ARB + MIDDLE"]).sum()))
+        m4.metric("Line outliers", int((board["Type"] == "LINE OUTLIER").sum()))
+        m5.metric("Watchlist hits", int(board.get("Watch", pd.Series(dtype=bool)).sum()))
+
+        f1, f2, f3, f4 = st.columns([1.3, 1.2, 1.2, 1.0])
+        all_types = list(dict.fromkeys(board["Type"].astype(str).tolist()))
+        filter_types = f1.multiselect("Opportunity types", all_types, default=all_types, key="radar_filter_types")
+        filter_sports = f2.multiselect("Sports", sorted(board["Sport"].astype(str).unique()), default=sorted(board["Sport"].astype(str).unique()), key="radar_filter_sports")
+        min_score = f3.slider("Minimum mispricing score", 0, 100, 45, 1, key="radar_min_score")
+        watch_only = f4.checkbox("Watchlist only", value=False, key="radar_watch_only")
+        search_text = st.text_input("Search player / team / market", value="", key="radar_search", placeholder="e.g. Josh Allen, Steelers, receiving yards")
+
+        view = board[
+            board["Type"].isin(filter_types)
+            & board["Sport"].astype(str).isin(filter_sports)
+            & (pd.to_numeric(board["Score"], errors="coerce") >= float(min_score))
+        ].copy()
+        if watch_only and "Watch" in view.columns:
+            view = view[view["Watch"]]
+        if search_text.strip():
+            q = search_text.strip().lower()
+            blob_cols = ["Sport", "Matchup", "Market", "Subject", "Pick", "Book", "Book 2", "Why"]
+            mask = view[blob_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower().str.contains(q, regex=False)
+            view = view[mask]
+
+        display = view.head(100).copy()
+        if display.empty:
+            st.caption("Nothing matches the current filters.")
+        else:
+            display.insert(0, "⭐", display.get("Watch", False).map(lambda x: "⭐" if bool(x) else ""))
+            display["Signal"] = display["Type"].map(_radar_type_icon)
+            display["Odds"] = display["Odds"].map(lambda x: fmt_odds(x) if pd.notna(x) else "—")
+            display["Odds 2"] = display["Odds 2"].map(lambda x: fmt_odds(x) if pd.notna(x) else "")
+            cols = ["⭐", "Score", "Signal", "Sport", "Matchup", "Market", "Pick", "Book", "Odds", "Book 2", "Odds 2", "Edge", "Compare"]
+            st.dataframe(
+                display[cols], width="stretch", hide_index=True,
+                column_config={
+                    "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+                    "Signal": st.column_config.TextColumn("Opportunity"),
+                },
+            )
+            st.download_button(
+                "Download current opportunity board CSV",
+                data=view.to_csv(index=False).encode("utf-8"),
+                file_name="market_radar_opportunities.csv",
+                mime="text/csv",
+                key="radar_download",
+            )
+
+            # Inspector: show why it was flagged and every underlying offer for that market.
+            labels = [f"{i+1}. {_radar_type_icon(r['Type'])} — {r['Sport']} — {r['Pick']} — {r['Edge']}" for i, (_, r) in enumerate(view.head(100).iterrows())]
+            selected_label = st.selectbox("Inspect an opportunity", labels, index=0, key="radar_inspect")
+            pos = labels.index(selected_label)
+            rr = view.head(100).iloc[pos]
+            box = st.container(border=True)
+            with box:
+                h1, h2, h3 = st.columns([1.2, 1.2, 1.0])
+                h1.metric("Mispricing score", f"{float(rr['Score']):.0f}/100")
+                h2.metric("Edge", str(rr.get("Edge") or "—"))
+                h3.metric("Type", str(rr.get("Type") or "—"))
+                st.markdown(f"**{rr.get('Sport')} · {rr.get('Matchup')} · {rr.get('Market')}**")
+                st.write(rr.get("Why") or "")
+                if str(rr.get("Details") or "").strip():
+                    st.info(str(rr.get("Details")))
+                if bool(rr.get("Watch")):
+                    st.success("⭐ This matches one of the sides/players you said you already like.")
+
+                if isinstance(offers, pd.DataFrame) and not offers.empty:
+                    source = offers[
+                        offers["Event ID"].astype(str).eq(str(rr.get("Event ID")))
+                        & offers["Market Key"].astype(str).eq(str(rr.get("Market Key")))
+                    ].copy()
+                    subject = str(rr.get("Subject") or "")
+                    if subject and subject not in {"Game", "Championship"}:
+                        narrower = source[source["Subject"].astype(str).eq(subject)]
+                        if not narrower.empty:
+                            source = narrower
+                    if not source.empty:
+                        source["Odds"] = source["Odds"].map(fmt_odds)
+                        source["Line"] = source["Line"].map(lambda x: "—" if pd.isna(x) else f"{float(x):g}")
+                        raw_cols = ["Book", "Side", "Line", "Odds", "Updated", "Bet Limit", "Link"]
+                        st.markdown("**Underlying prices used by the scanner**")
+                        st.dataframe(
+                            source[raw_cols].sort_values(["Side", "Line", "Book"], na_position="last"),
+                            width="stretch", hide_index=True,
+                            column_config={"Link": st.column_config.LinkColumn("Open book", display_text="Open")},
+                        )
+
+        with st.expander("Book / exchange coverage from this scan"):
+            cov = book_coverage_summary(offers, scan.get("book_keys")) if isinstance(offers, pd.DataFrame) else pd.DataFrame()
+            if cov.empty:
+                st.caption("No bookmaker offers were returned.")
+            else:
+                st.dataframe(cov, width="stretch", hide_index=True)
+
+    if scan.get("errors"):
+        with st.expander(f"Scan warnings ({len(scan['errors'])})"):
+            for x in scan["errors"]:
+                st.write("•", x)
+
+    st.caption(
+        "Score is an anomaly-ranking score, not a win probability. Arb math uses the exchange-fee safety buffer you selected; always verify the live executable price, limits, fees and liquidity before betting. "
+        "Middles can lose. Price/line outliers simply mean one of your books differs materially from the others—useful when it happens to be on a side you already like."
+    )
+
+
+# -----------------------------
 # UI
 # -----------------------------
-st.title("🏈 NFL Betting Lab — Auto Data")
-st.caption("Totals + V2.2 spread/moneyline probabilities + weather + live sportsbook prices. Data refreshes automatically.")
+st.title("🏈 NFL Betting Lab + Market Radar")
+st.caption("NFL model lab + automatic NFL/NBA/MLB/NHL market anomaly scanning across the books and exchanges you actually use.")
 
 
 with st.sidebar:
@@ -1111,10 +1627,10 @@ with st.sidebar:
     api_key = entered_key.strip() or secret_key.strip()
 
     selected_book_labels = st.multiselect(
-        "Sportsbooks to compare",
+        "My sportsbooks & exchanges",
         options=list(BOOKMAKER_OPTIONS.keys()),
         default=DEFAULT_BOOKS,
-        help="These books are used for line shopping, player-prop consensus and arbitrage scans. Up to 10 selected bookmaker keys are billed like one region by The Odds API.",
+        help="Used by Market Radar and the NFL line-shop tools. Up to 10 selected bookmaker keys are billed like one region by The Odds API. Caesars requires a paid Odds API subscription.",
     )
     selected_book_keys = [BOOKMAKER_OPTIONS[x] for x in selected_book_labels]
     bookmaker_csv = ",".join(selected_book_keys)
@@ -1142,6 +1658,10 @@ except Exception as exc:
     st.stop()
 
 render_forward_test_panel(schedule)
+
+# Pikkit-style multi-sport anomaly detector lives near the top of the app so it can be used
+# without scrolling through the NFL model sections first.
+render_market_radar(api_key, selected_book_keys, bookmaker_csv)
 
 upcoming = upcoming_schedule(schedule, days_ahead=12)
 if upcoming.empty:
@@ -1466,7 +1986,7 @@ else:
     st.info("Click the button above after odds have loaded. The scan checks every game in the selected week and keeps the top three in each market.")
 
 st.markdown("---")
-st.subheader("💰 Multi-book line shop, player props & arbitrage")
+st.subheader("💰 NFL detailed line shop, player props & arbitrage")
 st.caption(
     "Player-prop EV here is a **de-vigged market-consensus estimate**, not a trained player-prop prediction model yet. "
     "The scanner compares the best offered price with other sportsbooks at the exact same player/market/line. "
@@ -1604,11 +2124,14 @@ else:
             st.info("Choose the scope and markets, then click **Scan player props**. Scans are cached for about 90 seconds to reduce API usage.")
 
     with tab_arb:
+        st.caption("Legacy NFL exact-line view. The multi-sport Market Radar above is the preferred scanner because it can apply the configurable exchange-fee buffer and rank mispriced lines, not just exact arbs.")
+        if any(k in {"novig", "kalshi", "polymarket", "prophetx"} for k in selected_book_keys):
+            st.warning("This legacy tab uses raw displayed exchange prices and does not model exchange fees. Treat exchange-involved rows as candidates to verify, not locked profit. Market Radar is fee-buffer aware.")
         a1, a2 = st.columns(2)
         arb_stake = a1.number_input("Total stake for arb calculator ($)", min_value=1.0, value=100.0, step=25.0, key="arb_stake")
-        min_arb_roi = a2.number_input("Minimum guaranteed ROI %", min_value=0.0, value=0.0, step=0.1, key="arb_min_roi") / 100.0
+        min_arb_roi = a2.number_input("Minimum raw-price ROI %", min_value=0.0, value=0.0, step=0.1, key="arb_min_roi") / 100.0
         core_arbs = core_arbitrage_table(odds_events, total_stake=arb_stake, min_roi=min_arb_roi)
-        st.markdown("#### True arbitrage — moneylines, spreads & totals")
+        st.markdown("#### Potential exact arbitrage — moneylines, spreads & totals")
         if core_arbs.empty:
             st.info("No true core-market arbitrage is visible across the selected books right now.")
         else:
@@ -1621,7 +2144,7 @@ else:
             st.dataframe(z, width="stretch", hide_index=True)
 
         payloads = st.session_state.get("latest_prop_payloads", [])
-        st.markdown("#### True arbitrage — player props")
+        st.markdown("#### Potential exact arbitrage — player props")
         if payloads:
             parbs = prop_arbitrage_table(payloads, total_stake=arb_stake, min_roi=min_arb_roi)
             if parbs.empty:
