@@ -1,0 +1,64 @@
+{
+  "created_utc": "2026-09-18T12:33:18.536361+00:00",
+  "model_name": "NFL V2.5 LightGBM Ensemble",
+  "status": "Frozen 2026 challenger forward test",
+  "training_seasons": "2018-2025",
+  "training_games": 2227,
+  "feature_count": 631,
+  "architecture": "75% L1 LightGBM residual margin + 25% L2 LightGBM residual margin; L2 residual component shrunk to 75% toward market. Separate logistic calibrators for moneyline and cover probabilities.",
+  "walk_forward_2021_2025": {
+    "games": 1424,
+    "model_margin_mae": 9.24519307997618,
+    "market_margin_mae": 9.762289325842696,
+    "mae_improvement_points": 0.5170962458665151,
+    "mae_bootstrap": {
+      "mean_improvement": 0.518587935839893,
+      "ci_2_5": 0.3798539799408641,
+      "ci_97_5": 0.6638492541745046
+    },
+    "ats_direction_accuracy": 0.5988497483824586,
+    "ats_games": 1391,
+    "moneyline_brier_calibrated_in_sample_oof_fit": 0.1956597497740776,
+    "moneyline_market_brier": 0.21155213861384323,
+    "moneyline_logloss_calibrated_in_sample_oof_fit": 0.5722342100813755,
+    "moneyline_market_logloss": 0.6104214993793128,
+    "cover_probability_brier_calibrated_in_sample_oof_fit": 0.2253355249974388,
+    "cover_probability_logloss_calibrated_in_sample_oof_fit": 0.6403055904531607,
+    "per_season": [
+      {
+        "season": 2021,
+        "n": 285,
+        "model_mae": 9.979644027982332,
+        "market_mae": 10.666666666666666
+      },
+      {
+        "season": 2022,
+        "n": 284,
+        "model_mae": 8.299872945747769,
+        "market_mae": 8.783450704225352
+      },
+      {
+        "season": 2023,
+        "n": 285,
+        "model_mae": 9.409891566285303,
+        "market_mae": 9.98421052631579
+      },
+      {
+        "season": 2024,
+        "n": 285,
+        "model_mae": 9.223358283065783,
+        "market_mae": 9.703508771929824
+      },
+      {
+        "season": 2025,
+        "n": 285,
+        "model_mae": 9.309881664048037,
+        "market_mae": 9.670175438596491
+      }
+    ]
+  },
+  "validation_note": "All 2021-2025 walk-forward predictions informed final V2.5 development and calibration. They are development evidence, not a new untouched holdout. The 2026 forward test is the clean validation.",
+  "live_feature_note": "V2.5 intentionally uses the same live-generatable feature families as the existing V2.2/V2.3 pipeline: market/context, PBP team/matchup/possession, QB weekly, ESPN QBR, NGS, snaps, depth and injury counts. It does not depend on the sparse PFR/FTN families that were not in the V2.2 deployment feature list.",
+  "probability_note": "Moneyline and spread probabilities are calibrated from historical walk-forward predictions. Odds/EV are estimates, not guarantees.",
+  "lightgbm_version": "4.6.0"
+}

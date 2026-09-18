@@ -44,6 +44,13 @@ except Exception as _v24_exc:
     resolve_head_referee = None
     V24_SIDE_IMPORT_ERROR = str(_v24_exc)
 
+try:
+    from v2_side_live_v25 import build_side_prediction_v25
+    V25_SIDE_IMPORT_ERROR = None
+except Exception as _v25_exc:
+    build_side_prediction_v25 = None
+    V25_SIDE_IMPORT_ERROR = str(_v25_exc)
+
 # -----------------------------
 # App configuration
 # -----------------------------
@@ -1068,8 +1075,12 @@ def build_weekly_favorites_board(
     *, schedule, week_games, odds_events, prev_pbp, cur_pbp, prev_states, cur_states,
     season, week, strict_mode, root
 ):
-    """Rank picks by model confidence, not by EV. V2.4 handles sides; V1 handles totals."""
+    """Rank picks by model confidence, not by EV. V2.5 handles sides when available; V1 handles totals."""
     ml_rows, spread_rows, total_rows, skipped = [], [], [], []
+    side_builder = build_side_prediction_v25 if build_side_prediction_v25 is not None else build_side_prediction_v24
+    side_model_label = "V2.5" if build_side_prediction_v25 is not None else "V2.4"
+    if side_builder is None:
+        return {"ml": pd.DataFrame(), "spread": pd.DataFrame(), "total": pd.DataFrame(), "skipped": ["Side model unavailable"], "games_scanned": 0, "side_model": "unavailable"}
 
     for _, g in week_games.sort_values(["gameday", "gametime", "game_id"]).iterrows():
         away_t, home_t = str(g["away_team"]), str(g["home_team"])
@@ -1106,7 +1117,7 @@ def build_weekly_favorites_board(
         )
 
         try:
-            side = build_side_prediction_v24(
+            side = side_builder(
                 root=root, schedule=schedule, game=g, prev_pbp=prev_pbp, cur_pbp=cur_pbp,
                 home=home_t, away=away_t, season=int(season), week=int(week),
                 market_total=float(mkt["total"]), over_odds=float(mkt["over"]), under_odds=float(mkt["under"]),
@@ -1115,10 +1126,10 @@ def build_weekly_favorites_board(
                 home_ml=float(mkt["home_ml"]), away_ml=float(mkt["away_ml"]), dome=float(dome_i),
             )
         except Exception as exc:
-            skipped.append(f"{matchup} (V2.4: {exc})")
+            skipped.append(f"{matchup} ({side_model_label}: {exc})")
             continue
 
-        # Moneyline favorite = side with the larger V2.4 win probability. Rank is confidence only.
+        # Moneyline favorite = side with the larger side-model win probability. Rank is confidence only.
         if float(side["p_home_win"]) >= 0.5:
             ml_pick, ml_p, ml_price, ml_fair, ml_ev = home_t, float(side["p_home_win"]), mkt["home_ml"], side["fair_home_ml"], side["home_ml_ev"]
         else:
@@ -1126,10 +1137,10 @@ def build_weekly_favorites_board(
         ml_rows.append({
             "Matchup": matchup, "Pick": f"{ml_pick} ML", "Confidence": ml_p,
             "Price": ml_price, "Fair": ml_fair, "EV": float(ml_ev),
-            "V2.4 margin": float(side["predicted_margin"]), "Book": mkt["book"],
+            "Side margin": float(side["predicted_margin"]), "Book": mkt["book"],
         })
 
-        # Spread favorite = side with the larger V2.4 cover probability.
+        # Spread favorite = side with the larger side-model cover probability.
         if float(side["p_home_cover"]) >= 0.5:
             sp_pick, sp_line, sp_p, sp_price, sp_ev = home_t, float(mkt["home_spread"]), float(side["p_home_cover"]), mkt["home_spread_odds"], side["home_spread_ev"]
         else:
@@ -1165,13 +1176,14 @@ def build_weekly_favorites_board(
         "total": top3(total_rows, "Model edge"),
         "skipped": skipped,
         "games_scanned": len(ml_rows),
+        "side_model": side_model_label,
     }
 
 
 def render_weekly_favorites(board, week):
     st.subheader(f"⭐ Weekly Model Favorites — Week {int(week)}")
     st.caption(
-        "These are ranked by MODEL CONFIDENCE, not by expected value. Moneyline and spread use V2.4; totals use the experimental V1 totals model. "
+        f"These are ranked by MODEL CONFIDENCE, not by expected value. Moneyline and spread use {board.get('side_model','V2.5')}; totals use the experimental V1 totals model. "
         "EV and prices are shown only as context, so a top-ranked pick can still be a bad price."
     )
     if not board or board.get("games_scanned", 0) == 0:
@@ -1180,7 +1192,7 @@ def render_weekly_favorites(board, week):
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Games scanned", board.get("games_scanned", 0))
-    c2.metric("Side model", "V2.4")
+    c2.metric("Side model", board.get("side_model", "V2.5"))
     c3.metric("Totals model", "V1 experimental")
 
     def prep(df, kind):
@@ -1195,8 +1207,8 @@ def render_weekly_favorites(board, week):
             z["Price"] = z["Price"].map(fmt_odds)
         if "Fair" in z:
             z["Fair"] = z["Fair"].map(fmt_odds)
-        if "V2.4 margin" in z:
-            z["V2.4 margin"] = z["V2.4 margin"].map(lambda x: f"{float(x):+.1f}")
+        if "Side margin" in z:
+            z["Side margin"] = z["Side margin"].map(lambda x: f"{float(x):+.1f}")
         if "Model margin edge" in z:
             z["Model margin edge"] = z["Model margin edge"].map(lambda x: f"{float(x):.1f} pts")
         if "V1 model total" in z:
@@ -2126,11 +2138,12 @@ board_key = f"weekly_favorites_{season}_{week}"
 if st.button(f"Build / refresh Week {week} model favorites", type="primary", key=f"weekly_favorites_button_{season}_{week}"):
     if not api_key:
         st.warning("Add The Odds API key first so the weekly board can use current moneyline/spread/total markets.")
-    elif build_side_prediction_v24 is None:
-        st.warning(f"V2.4 is unavailable: {V24_SIDE_IMPORT_ERROR}")
+    elif build_side_prediction_v25 is None and build_side_prediction_v24 is None:
+        st.warning(f"Side models are unavailable. V2.5: {V25_SIDE_IMPORT_ERROR}; V2.4: {V24_SIDE_IMPORT_ERROR}")
     else:
         try:
-            with st.spinner(f"Scanning Week {week} games with V2.4 sides + V1 totals…"):
+            side_label = "V2.5" if build_side_prediction_v25 is not None else "V2.4"
+            with st.spinner(f"Scanning Week {week} games with {side_label} sides + V1 totals…"):
                 st.session_state[board_key] = build_weekly_favorites_board(
                     schedule=schedule, week_games=week_games, odds_events=odds_events,
                     prev_pbp=prev_pbp, cur_pbp=cur_pbp, prev_states=prev_states, cur_states=cur_states,
@@ -2149,7 +2162,7 @@ st.subheader("💰 NFL detailed line shop, player props & arbitrage")
 st.caption(
     "Player-prop EV here is a **de-vigged market-consensus estimate**, not a trained player-prop prediction model yet. "
     "The scanner compares the best offered price with other sportsbooks at the exact same player/market/line. "
-    "Arbitrage is math-only and does not depend on V2.4."
+    "Arbitrage is math-only and does not depend on the NFL prediction model."
 )
 
 if not api_key:
@@ -2364,6 +2377,107 @@ if result["signal"] != "PASS":
     )
 else:
     st.info("V1 filter says PASS.")
+
+# -----------------------------
+# V2.5 Challenger — LightGBM residual ensemble
+# -----------------------------
+st.subheader("V2.5 Challenger — Best Current Side Model")
+st.caption(
+    "V2.5 is a new 2026 challenger trained only on 2018–2025 games. It uses the same live-generatable feature families as the existing side pipeline, "
+    "but replaces the older Ridge/HistGradientBoosting margin engine with a two-model LightGBM residual ensemble and separately calibrated ML/spread probabilities. "
+    "All 2021–2025 results were used for development; 2026 remains the clean forward test."
+)
+
+v25_result = None
+v25_error = None
+if build_side_prediction_v25 is None:
+    v25_error = f"V2.5 module could not load: {V25_SIDE_IMPORT_ERROR}"
+else:
+    try:
+        with st.spinner("Running V2.5 LightGBM challenger…"):
+            v25_result = build_side_prediction_v25(
+                root=ROOT,
+                schedule=schedule,
+                game=game,
+                prev_pbp=prev_pbp,
+                cur_pbp=cur_pbp,
+                home=home,
+                away=away,
+                season=season,
+                week=week,
+                market_total=float(market_total),
+                over_odds=float(over_odds),
+                under_odds=float(under_odds),
+                home_spread=float(home_spread),
+                home_spread_odds=float(home_spread_odds),
+                away_spread_odds=float(away_spread_odds),
+                home_ml=float(home_ml),
+                away_ml=float(away_ml),
+                dome=float(dome),
+            )
+    except Exception as exc:
+        v25_error = str(exc)
+
+if v25_error:
+    st.error(f"V2.5 challenger could not run: {v25_error}")
+
+if v25_result:
+    margin = float(v25_result["predicted_margin"])
+    margin_label = f"{home} by {margin:.1f}" if margin >= 0 else f"{away} by {abs(margin):.1f}"
+    market_home_margin = -float(home_spread)
+    edge_pts = margin - market_home_margin
+    eligible_cov = float(v25_result.get("eligible_coverage", v25_result.get("coverage", 0.0)))
+    ref_adj25 = float(v25_result.get("referee_adjustment_points", 0.0))
+
+    a, b, c, d = st.columns(4)
+    a.metric("V2.5 projected margin", margin_label)
+    b.metric("Vs market spread", f"{edge_pts:+.2f} pts")
+    c.metric("Eligible live coverage", f"{eligible_cov:.0%}")
+    d.metric("Status", "2026 forward test")
+
+    st.markdown("##### Moneyline")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} win probability", f"{v25_result['p_home_win']:.1%}")
+    b.metric(f"{home} ML EV", f"{v25_result['home_ml_ev']:+.1%}")
+    c.metric(f"{away} win probability", f"{v25_result['p_away_win']:.1%}")
+    d.metric(f"{away} ML EV", f"{v25_result['away_ml_ev']:+.1%}")
+
+    st.markdown("##### Point spread")
+    a, b, c, d = st.columns(4)
+    a.metric(f"{home} {home_spread:+.1f} cover probability", f"{v25_result['p_home_cover']:.1%}")
+    b.metric(f"{home} spread EV", f"{v25_result['home_spread_ev']:+.1%}")
+    c.metric(f"{away} {-home_spread:+.1f} cover probability", f"{v25_result['p_away_cover']:.1%}")
+    d.metric(f"{away} spread EV", f"{v25_result['away_spread_ev']:+.1%}")
+
+    fam = v25_result.get("families", {}) or {}
+    loaded = [k.upper() for k, v in fam.items() if v]
+    missing_fam = [k.upper() for k, v in fam.items() if not v]
+    st.caption("Live families loaded: " + (", ".join(loaded) if loaded else "none") + (" · unavailable/imputed: " + ", ".join(missing_fam) if missing_fam else ""))
+    if abs(ref_adj25) >= 0.01:
+        st.caption(f"V2.5 includes the same tiny leakage-safe referee overlay used by V2.4: {ref_adj25:+.2f} points.")
+
+    unexpected25 = len(v25_result.get("unexpected_missing", []) or [])
+    structural25 = len(v25_result.get("structural_missing", []) or [])
+    if unexpected25:
+        st.warning(
+            f"V2.5 has {unexpected25} unexpectedly missing live features beyond {structural25} structurally unavailable features. "
+            "Large probability/EV gaps should be treated cautiously until those feeds are fresh."
+        )
+
+    with st.expander("Why V2.5 is different / development results"):
+        st.markdown(
+            """
+- **Margin engine:** 75% robust L1 LightGBM + 25% L2 LightGBM. The second component is deliberately shrunk toward the market to reduce overreaction.
+- **Live inputs:** market/context + play-by-play team/matchup/possession data + QB weekly stats + ESPN QBR + Next Gen Stats + snaps + depth + live injuries.
+- **Probability calibration:** moneyline and cover probabilities are calibrated separately from historical walk-forward predictions instead of assuming the raw margin distribution is perfectly normal.
+- **2021–2025 development walk-forward:** **9.245 margin MAE** vs **9.762 for the closing spread**, an average improvement of about **0.52 points/game** across 1,424 games.
+- The model beat the market MAE in each individual development season from 2021 through 2025. Bootstrap resampling of the historical MAE improvement was roughly **+0.38 to +0.66 points/game (95% interval)**.
+- Historical ATS direction was about **59.9%** across non-pushes, but that is development evidence, **not an expectation for future betting performance**.
+- **2026 is the real forward test.** V2.2/V2.3/V2.4 stay visible so V2.5 cannot silently replace weaker results after the fact.
+            """
+        )
+
+st.markdown("---")
 
 # -----------------------------
 # V2.4 Challenger — head referee tracker + V2.3
@@ -2818,7 +2932,7 @@ with st.expander("Data sources & refresh behavior"):
         """
 - **Schedule / game metadata:** nflverse `games.csv`
 - **V1 totals inputs:** calculated from nflverse play-by-play
-- **V2.2 spread/ML inputs:** nflverse play-by-play, weekly player/QB stats, ESPN QBR, Next Gen Stats, snap counts, depth charts, and live market prices when available
+- **V2.2/V2.5 spread & ML inputs:** nflverse play-by-play, weekly player/QB stats, ESPN QBR, Next Gen Stats, snap counts, depth charts, live injuries, and live market prices when available
 - **Weather:** Open-Meteo stadium-area forecast (used by V1 totals; V2.2 side model was trained without observed game-weather leakage)
 - **Sportsbook totals / spreads / moneylines / player props / multi-book prices:** The Odds API when a key is configured
 - **Fallback line:** nflverse schedule snapshot or manual override
@@ -2834,5 +2948,5 @@ with st.expander("Model status"):
         f"V1 historical holdout: {int(HOLDOUT['Wins'])}-{int(HOLDOUT['Losses'])}, "
         f"{float(HOLDOUT['Win_Pct']):.1%} wins, {float(HOLDOUT['ROI']):.1%} ROI."
     )
-    st.caption("V2.2 spread/moneyline model: frozen after 2018–2025 training and now labeled as a 2026 forward test. Totals remain on V1 while the separate totals R&D continues.")
+    st.caption("V2.5 spread/moneyline challenger: LightGBM residual ensemble trained on 2018–2025 only; 2026 is the clean forward test. V2.2/V2.3/V2.4 remain visible as frozen benchmarks. Totals remain on V1 while the separate totals R&D continues.")
 
