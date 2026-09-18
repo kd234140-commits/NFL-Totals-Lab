@@ -553,6 +553,34 @@ def fetch_sport_event_odds(_api_key: str, sport_key: str, event_id: str, markets
     return r.json(), _odds_api_usage_from_response(r)
 
 
+def fetch_sport_event_odds_live(_api_key: str, sport_key: str, event_id: str, markets_csv: str, bookmakers_csv: str):
+    """Uncached one-market check used by the Market Radar inspector.
+
+    This intentionally bypasses Streamlit's broad-scan cache so a user can verify
+    an interesting quote immediately before acting on it.
+    """
+    if not _api_key or not event_id or not markets_csv:
+        return {}, {}
+    url = f"{ODDS_API_BASE}/{sport_key}/events/{event_id}/odds"
+    params = {
+        "apiKey": _api_key,
+        "markets": markets_csv,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "includeLinks": "true",
+        "includeBetLimits": "true",
+    }
+    if bookmakers_csv:
+        params["bookmakers"] = bookmakers_csv
+    else:
+        params["regions"] = "us"
+    r = requests.get(url, params=params, timeout=45)
+    if r.status_code == 404:
+        return {}, _odds_api_usage_from_response(r)
+    _raise_market_api_error(r, f"{sport_key} live verification request")
+    return r.json(), _odds_api_usage_from_response(r)
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_futures_odds(_api_key: str, future_sport_key: str, bookmakers_csv: str):
     if not _api_key:
@@ -1260,6 +1288,18 @@ def _radar_type_icon(kind):
     return k
 
 
+def _quote_age_text(value):
+    ts = _parse_utc_timestamp(value)
+    if ts is None:
+        return "—"
+    age = max(0.0, (pd.Timestamp.now(tz="UTC") - ts).total_seconds())
+    if age < 60:
+        return f"{int(age)}s"
+    if age < 3600:
+        return f"{int(age // 60)}m {int(age % 60)}s"
+    return f"{age / 3600:.1f}h"
+
+
 def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
     st.markdown("---")
     st.subheader("🔎 Market Radar — automatic mispricing scanner")
@@ -1575,15 +1615,67 @@ def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
                         if not narrower.empty:
                             source = narrower
                     if not source.empty:
+                        source["Quote age"] = source["Updated"].map(_quote_age_text)
                         source["Odds"] = source["Odds"].map(fmt_odds)
                         source["Line"] = source["Line"].map(lambda x: "—" if pd.isna(x) else f"{float(x):g}")
-                        raw_cols = ["Book", "Side", "Line", "Odds", "Updated", "Bet Limit", "Link"]
+                        raw_cols = ["Book", "Side", "Line", "Odds", "Quote age", "Updated", "Bet Limit", "Link"]
                         st.markdown("**Underlying prices used by the scanner**")
                         st.dataframe(
                             source[raw_cols].sort_values(["Side", "Line", "Book"], na_position="last"),
                             width="stretch", hide_index=True,
                             column_config={"Link": st.column_config.LinkColumn("Open book", display_text="Open")},
                         )
+
+                # One-market uncached verification. This is deliberately separate from the
+                # broad scan so the user does not need to spend credits rescanning every game.
+                event_id = str(rr.get("Event ID") or "")
+                market_key = str(rr.get("Market Key") or "")
+                league = str(rr.get("Sport") or "")
+                can_live_check = bool(event_id and market_key and market_key != "outrights" and league in SPORT_KEYS)
+                if can_live_check:
+                    if st.button("🔄 Verify this market live", key=f"radar_live_{event_id}_{market_key}_{pos}"):
+                        try:
+                            live_payload, live_usage = fetch_sport_event_odds_live(
+                                api_key, SPORT_KEYS[league], event_id, market_key, bookmaker_csv
+                            )
+                            remember_odds_api_usage(live_usage)
+                            live_frame = normalize_market_payloads(live_payload, league)
+                            st.session_state["radar_live_verify"] = {
+                                "event_id": event_id, "market_key": market_key,
+                                "league": league, "frame": live_frame,
+                                "checked_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        except Exception as exc:
+                            st.error(f"Live verification failed: {exc}")
+
+                    live_state = st.session_state.get("radar_live_verify") or {}
+                    if live_state.get("event_id") == event_id and live_state.get("market_key") == market_key:
+                        lf = live_state.get("frame")
+                        if isinstance(lf, pd.DataFrame) and not lf.empty:
+                            subject = str(rr.get("Subject") or "")
+                            if subject and subject not in {"Game", "Championship"}:
+                                n = lf[lf["Subject"].astype(str).eq(subject)].copy()
+                                if not n.empty:
+                                    lf = n
+                            lf = lf.copy()
+                            lf["Quote age"] = lf["Updated"].map(_quote_age_text)
+                            lf["Odds"] = lf["Odds"].map(fmt_odds)
+                            lf["Line"] = lf["Line"].map(lambda x: "—" if pd.isna(x) else f"{float(x):g}")
+                            checked = live_state.get("checked_at")
+                            try:
+                                checked = pd.Timestamp(checked).tz_convert("America/New_York").strftime("%-I:%M:%S %p ET")
+                            except Exception:
+                                pass
+                            st.success(f"Fresh one-market verification completed at {checked}.")
+                            st.dataframe(
+                                lf[["Book", "Side", "Line", "Odds", "Quote age", "Updated", "Bet Limit", "Link"]]
+                                  .sort_values(["Side", "Line", "Book"], na_position="last"),
+                                width="stretch", hide_index=True,
+                                column_config={"Link": st.column_config.LinkColumn("Open book", display_text="Open")},
+                            )
+                        else:
+                            st.warning("The fresh request returned no offers for this market.")
+                    st.caption("Live verification requests only this one market for this one event. It can use API credits, but avoids rerunning the full radar.")
 
         with st.expander("Book / exchange coverage from this scan"):
             cov = book_coverage_summary(offers, scan.get("book_keys")) if isinstance(offers, pd.DataFrame) else pd.DataFrame()

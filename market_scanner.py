@@ -859,50 +859,116 @@ def _opp_row(*, score, kind, row, pick, compare, edge, why, book=None, odds=None
     }
 
 
+def _mainish_offer(rows):
+    """Choose a representative/main-ish quote when a feed returns multiple points.
+
+    Pikkit-style boards usually show each book's main line, not every alternate rung.
+    Main player-prop/spread/total prices are usually closest to standard two-way juice,
+    so prefer prices whose absolute American odds are closest to 110. This avoids
+    treating a -350 alternate rung as that book's representative market line.
+    """
+    valid = []
+    for r in rows or []:
+        o = _num(r.get("Odds"))
+        if o is None or o == 0:
+            continue
+        # Main two-way prices are generally near even/standard juice. The second
+        # term breaks +110/-110 style ties toward the price closer to 50% implied.
+        p = implied_prob(o)
+        score = (abs(abs(o) - 110.0), abs((p if p is not None else 0.5) - 0.5))
+        valid.append((score, r))
+    return min(valid, key=lambda x: x[0])[1] if valid else None
+
+
 def price_outlier_opportunities(offers: pd.DataFrame, min_payout_advantage: float = 0.015,
                                 min_books: int = 2, exchange_fee_buffer: float = 0.0) -> pd.DataFrame:
-    """Find a book paying materially more for the exact same selection/line."""
+    """Find exact-line price anomalies without mixing sportsbook and exchange consensus.
+
+    Important rules:
+    - alternate ladders are excluded from *price-consensus* alerts (they remain usable
+      for arbs/middles), because heavy juice on an alternate point is normal;
+    - sportsbook outliers are compared only with other sportsbooks;
+    - exchange gaps compare the best exchange quote with the sportsbook median;
+    - an exchange merely being present no longer turns a sportsbook alert into an
+      ``EXCHANGE GAP``.
+    """
     if offers is None or offers.empty:
         return pd.DataFrame()
     req = {"Event ID", "Market Key", "Subject", "Side", "Line", "Odds", "Book Key", "Book"}
     if not req.issubset(offers.columns):
         return pd.DataFrame()
+
+    base = offers[~offers["Market Key"].astype(str).str.contains("alternate", case=False, na=False)].copy()
     rows = []
     keys = ["Event ID", "Market Key", "Subject", "Side", "Line"]
-    for _, g in offers.groupby(keys, dropna=False):
-        # One best price per book for this exact selection.
+
+    for _, g in base.groupby(keys, dropna=False):
         book_rows = []
         for _, bg in g.groupby("Book Key", dropna=False):
             rr = _best_offer_adjusted(bg.to_dict("records"), exchange_fee_buffer)
             if rr:
                 book_rows.append(rr)
-        if len(book_rows) < max(2, int(min_books)):
+        if len(book_rows) < 2:
             continue
-        candidate = _best_offer_adjusted(book_rows, exchange_fee_buffer)
-        if not candidate:
-            continue
-        cand_dec = _effective_decimal(candidate, exchange_fee_buffer)
-        others = [r for r in book_rows if r.get("Book Key") != candidate.get("Book Key")]
-        other_dec = sorted([_effective_decimal(r, exchange_fee_buffer) for r in others if _effective_decimal(r, exchange_fee_buffer)])
-        if cand_dec is None or not other_dec:
-            continue
-        median_dec = float(pd.Series(other_dec).median())
-        advantage = cand_dec / median_dec - 1.0
-        if advantage < float(min_payout_advantage):
-            continue
-        median_prob = 1.0 / median_dec
-        median_american = fair_american(median_prob)
-        exchange_gap = bool(candidate.get("Exchange")) or any(bool(r.get("Exchange")) for r in others)
-        kind = "EXCHANGE GAP" if exchange_gap else "PRICE OUTLIER"
-        score = 47 + min(43, advantage * 360) + min(6, max(0, len(book_rows) - 2) * 1.5)
-        pick = _selection_text(candidate)
-        compare = f"Other-book median {_fmt_odds_text(median_american)}"
-        edge = f"{advantage:+.1%} payout"
-        why = f"{candidate.get('Book')} is paying {_fmt_odds_text(candidate.get('Odds'))} for the exact same selection; the other-book median is about {_fmt_odds_text(median_american)}."
-        rows.append(_opp_row(
-            score=score, kind=kind, row=candidate, pick=pick, compare=compare, edge=edge, why=why,
-            payout_adv=advantage,
-        ))
+
+        sports = [r for r in book_rows if not bool(r.get("Exchange"))]
+        exchanges = [r for r in book_rows if bool(r.get("Exchange"))]
+
+        # 1) Sportsbook-vs-sportsbook exact-line price outlier.
+        if len(sports) >= max(2, int(min_books)):
+            candidate = _best_offer_adjusted(sports, exchange_fee_buffer)
+            others = [r for r in sports if r.get("Book Key") != candidate.get("Book Key")]
+            cand_dec = _effective_decimal(candidate, exchange_fee_buffer)
+            other_dec = [_effective_decimal(r, exchange_fee_buffer) for r in others]
+            other_dec = [x for x in other_dec if x]
+            if cand_dec is not None and other_dec:
+                median_dec = float(pd.Series(other_dec).median())
+                advantage = cand_dec / median_dec - 1.0
+                if advantage >= float(min_payout_advantage):
+                    median_prob = 1.0 / median_dec
+                    median_american = fair_american(median_prob)
+                    score = 45 + min(40, advantage * 330) + min(7, max(0, len(sports) - 2) * 1.5)
+                    rows.append(_opp_row(
+                        score=score,
+                        kind="PRICE OUTLIER",
+                        row=candidate,
+                        pick=_selection_text(candidate),
+                        compare=f"Same-line sportsbook median {_fmt_odds_text(median_american)}",
+                        edge=f"{advantage:+.1%} payout",
+                        why=(f"{candidate.get('Book')} is paying {_fmt_odds_text(candidate.get('Odds'))} "
+                             f"for the exact same line; the other sportsbook median at this exact point is "
+                             f"about {_fmt_odds_text(median_american)}."),
+                        payout_adv=advantage,
+                        details=f"Exact-line comparison across {len(sports)} sportsbooks. Exchange quotes are not used to set this sportsbook consensus.",
+                    ))
+
+        # 2) Exchange-vs-sportsbook exact-line gap.
+        # Require at least one sportsbook comparator; two is preferable and gets a higher score.
+        if exchanges and sports:
+            ex = _best_offer_adjusted(exchanges, exchange_fee_buffer)
+            ex_dec = _effective_decimal(ex, exchange_fee_buffer)
+            sp_dec = [_effective_decimal(r, exchange_fee_buffer) for r in sports]
+            sp_dec = [x for x in sp_dec if x]
+            if ex_dec is not None and sp_dec:
+                median_dec = float(pd.Series(sp_dec).median())
+                advantage = ex_dec / median_dec - 1.0
+                if advantage >= float(min_payout_advantage):
+                    median_prob = 1.0 / median_dec
+                    median_american = fair_american(median_prob)
+                    score = 49 + min(40, advantage * 330) + min(7, max(0, len(sports) - 1) * 1.5)
+                    rows.append(_opp_row(
+                        score=score,
+                        kind="EXCHANGE GAP",
+                        row=ex,
+                        pick=_selection_text(ex),
+                        compare=f"Same-line sportsbook median {_fmt_odds_text(median_american)}",
+                        edge=f"{advantage:+.1%} payout",
+                        why=(f"{ex.get('Book')} is paying {_fmt_odds_text(ex.get('Odds'))} at this exact line, "
+                             f"versus a sportsbook median of about {_fmt_odds_text(median_american)}."),
+                        payout_adv=advantage,
+                        details=f"Exchange quote compared with {len(sports)} sportsbook quote(s) at the exact same point. Fee buffer is applied to the exchange quote when configured.",
+                    ))
+
     return pd.DataFrame(rows)
 
 
@@ -920,52 +986,84 @@ def _line_direction(market_key: str, side: str):
 
 def line_outlier_opportunities(offers: pd.DataFrame, min_line_advantage: float = 0.5,
                                min_books: int = 2) -> pd.DataFrame:
-    """Find materially better main lines, even when there is no arbitrage."""
+    """Compare representative *main* lines, not the most extreme alternate rung.
+
+    This is the Pikkit-like comparison: one representative line per book, then surface
+    a sportsbook or exchange whose line is materially better than sportsbook consensus.
+    """
     if offers is None or offers.empty:
         return pd.DataFrame()
     rows = []
     gkeys = ["Event ID", "Market Key", "Subject", "Side"]
     line_df = offers[offers["Line"].notna()].copy()
     line_df = line_df[~line_df["Market Key"].astype(str).str.contains("alternate", case=False, na=False)]
+
     for _, g in line_df.groupby(gkeys, dropna=False):
-        if g["Book Key"].nunique() < max(2, int(min_books)):
-            continue
         direction = _line_direction(g.iloc[0]["Market Key"], g.iloc[0]["Side"])
         if direction is None:
             continue
-        # One representative line per book. If duplicates exist, choose the most favorable one.
+
         reps = []
         for _, bg in g.groupby("Book Key", dropna=False):
-            if direction > 0:
-                best_line = bg["Line"].max()
-            else:
-                best_line = bg["Line"].min()
-            rr = best_offer(bg[bg["Line"] == best_line].to_dict("records"))
+            rr = _mainish_offer(bg.to_dict("records"))
             if rr:
                 reps.append(rr)
-        if len(reps) < max(2, int(min_books)):
+        if len(reps) < 2:
             continue
-        # Candidate is the most favorable line; compare with other-book median.
-        candidate = max(reps, key=lambda r: direction * float(r["Line"]))
-        other_lines = [float(r["Line"]) for r in reps if r.get("Book Key") != candidate.get("Book Key")]
-        if not other_lines:
-            continue
-        median_line = float(pd.Series(other_lines).median())
-        advantage = direction * (float(candidate["Line"]) - median_line)
-        if advantage < float(min_line_advantage) - 1e-9:
-            continue
-        rel = advantage / max(1.0, abs(median_line))
-        score = 56 + min(28, rel * 320) + min(7, max(0, len(reps) - 2) * 1.4)
-        pick = _selection_text(candidate)
-        compare = f"Other-book median line {median_line:g}"
-        edge = f"{advantage:g} better line"
-        why = f"{candidate.get('Book')} has {pick}; the other selected books center around {median_line:g} for the same side."
-        rows.append(_opp_row(
-            score=score, kind="LINE OUTLIER", row=candidate, pick=pick, compare=compare, edge=edge, why=why,
-            line_adv=advantage,
-        ))
-    return pd.DataFrame(rows)
 
+        sports = [r for r in reps if not bool(r.get("Exchange"))]
+        exchanges = [r for r in reps if bool(r.get("Exchange"))]
+
+        # Sportsbook line outlier versus other sportsbook main lines.
+        if len(sports) >= max(2, int(min_books)):
+            best_metric = max(direction * float(r["Line"]) for r in sports)
+            tied = [r for r in sports if abs(direction * float(r["Line"]) - best_metric) < 1e-9]
+            candidate = _best_offer_adjusted(tied, 0.0) or tied[0]
+            others = [r for r in sports if r.get("Book Key") != candidate.get("Book Key")]
+            other_lines = [float(r["Line"]) for r in others]
+            if other_lines:
+                median_line = float(pd.Series(other_lines).median())
+                advantage = direction * (float(candidate["Line"]) - median_line)
+                if advantage >= float(min_line_advantage) - 1e-9:
+                    rel = advantage / max(1.0, abs(median_line))
+                    score = 56 + min(28, rel * 320) + min(7, max(0, len(sports) - 2) * 1.4)
+                    rows.append(_opp_row(
+                        score=score,
+                        kind="LINE OUTLIER",
+                        row=candidate,
+                        pick=_selection_text(candidate),
+                        compare=f"Sportsbook main-line median {median_line:g}",
+                        edge=f"{advantage:g} better line",
+                        why=(f"{candidate.get('Book')} has {_selection_text(candidate)} at roughly main-line juice; "
+                             f"the other sportsbooks center around {median_line:g} for the same side."),
+                        line_adv=advantage,
+                        details=f"Representative main-line comparison across {len(sports)} sportsbooks; alternate ladders are excluded.",
+                    ))
+
+        # Exchange line gap versus sportsbook main-line consensus.
+        if exchanges and sports:
+            best_metric = max(direction * float(r["Line"]) for r in exchanges)
+            tied = [r for r in exchanges if abs(direction * float(r["Line"]) - best_metric) < 1e-9]
+            candidate = _best_offer_adjusted(tied, 0.0) or tied[0]
+            median_line = float(pd.Series([float(r["Line"]) for r in sports]).median())
+            advantage = direction * (float(candidate["Line"]) - median_line)
+            if advantage >= float(min_line_advantage) - 1e-9:
+                rel = advantage / max(1.0, abs(median_line))
+                score = 54 + min(28, rel * 320) + min(7, max(0, len(sports) - 1) * 1.4)
+                rows.append(_opp_row(
+                    score=score,
+                    kind="EXCHANGE GAP",
+                    row=candidate,
+                    pick=_selection_text(candidate),
+                    compare=f"Sportsbook main-line median {median_line:g}",
+                    edge=f"{advantage:g} better line",
+                    why=(f"{candidate.get('Book')} has {_selection_text(candidate)}; sportsbook main lines center around "
+                         f"{median_line:g} for the same side."),
+                    line_adv=advantage,
+                    details=f"Exchange main-line quote compared with {len(sports)} sportsbook main-line quote(s); alternate ladders are excluded.",
+                ))
+
+    return pd.DataFrame(rows)
 
 def _best_two_side_pair(g: pd.DataFrame, side_a: str, side_b: str):
     a = g[g["Side"].astype(str).str.lower().eq(str(side_a).lower())].to_dict("records")
