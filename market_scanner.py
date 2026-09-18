@@ -634,6 +634,49 @@ def market_label(market_key: str) -> str:
     return GENERIC_MARKET_LABELS.get(str(market_key), str(market_key).replace("_", " ").title())
 
 
+def market_group(market_key: str) -> str:
+    """Broad display/ranking family used by Market Radar.
+
+    The scanner deliberately keeps scorer longshots separate from normal yardage /
+    counting props. A 25%-30% payout difference on a +3000 first-scorer market can
+    look enormous in relative terms while representing only a small absolute
+    probability disagreement, so those rows should not crowd out core lines.
+    """
+    mk = str(market_key or "")
+    low = mk.lower()
+    if low == "outrights" or "championship" in low:
+        return "Futures"
+    if low in {
+        "player_1st_td", "player_last_td", "player_anytime_td", "player_tds",
+        "player_first_basket", "player_goal_scorer_first",
+        "player_goal_scorer_last", "player_goal_scorer_anytime",
+    } or "scorer" in low:
+        return "TD / scorer props"
+    if low.startswith(("h2h", "spreads", "totals", "team_totals", "alternate_spreads", "alternate_totals")):
+        return "Game lines"
+    if low.startswith(("player_", "batter_", "pitcher_")):
+        return "Core player props"
+    return "Other markets"
+
+
+def _longshot_gap_score_cap(market_key: str, median_prob: float | None) -> float:
+    """Cap ranking inflation from large relative payout gaps on tiny probabilities."""
+    mk = str(market_key or "").lower()
+    group = market_group(mk)
+    if group == "TD / scorer props":
+        if any(x in mk for x in ("1st", "first", "last")):
+            return 74.0
+        return 82.0
+    if median_prob is not None:
+        if median_prob < 0.05:
+            return 74.0
+        if median_prob < 0.10:
+            return 78.0
+        if median_prob < 0.15:
+            return 83.0
+    return 100.0
+
+
 def _num(value):
     try:
         x = float(value)
@@ -839,6 +882,7 @@ def _opp_row(*, score, kind, row, pick, compare, edge, why, book=None, odds=None
         "Commence": row.get("Commence"),
         "Market": row.get("Market", market_label(row.get("Market Key", ""))),
         "Market Key": row.get("Market Key", ""),
+        "Market Group": market_group(row.get("Market Key", "")),
         "Subject": row.get("Subject", ""),
         "Pick": pick,
         "Book": book if book is not None else row.get("Book", ""),
@@ -928,6 +972,7 @@ def price_outlier_opportunities(offers: pd.DataFrame, min_payout_advantage: floa
                     median_prob = 1.0 / median_dec
                     median_american = fair_american(median_prob)
                     score = 45 + min(40, advantage * 330) + min(7, max(0, len(sports) - 2) * 1.5)
+                    score = min(score, _longshot_gap_score_cap(candidate.get("Market Key"), median_prob))
                     rows.append(_opp_row(
                         score=score,
                         kind="PRICE OUTLIER",
@@ -956,6 +1001,7 @@ def price_outlier_opportunities(offers: pd.DataFrame, min_payout_advantage: floa
                     median_prob = 1.0 / median_dec
                     median_american = fair_american(median_prob)
                     score = 49 + min(40, advantage * 330) + min(7, max(0, len(sports) - 1) * 1.5)
+                    score = min(score, _longshot_gap_score_cap(ex.get("Market Key"), median_prob))
                     rows.append(_opp_row(
                         score=score,
                         kind="EXCHANGE GAP",
@@ -1310,6 +1356,12 @@ def build_opportunity_board(offers: pd.DataFrame, *, total_stake: float = 100.0,
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
+    if "Market Group" not in out.columns:
+        out["Market Group"] = out.get("Market Key", "").map(market_group)
+    else:
+        missing_group = out["Market Group"].isna() | out["Market Group"].astype(str).eq("")
+        if missing_group.any():
+            out.loc[missing_group, "Market Group"] = out.loc[missing_group, "Market Key"].map(market_group)
     # Remove exact duplicate detector outputs while preserving different opportunity types.
     dedupe = ["Type", "Sport", "Event ID", "Market Key", "Subject", "Pick", "Book", "Book 2"]
     present = [c for c in dedupe if c in out.columns]

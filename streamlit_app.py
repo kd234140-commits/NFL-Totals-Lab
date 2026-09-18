@@ -1300,12 +1300,58 @@ def _quote_age_text(value):
     return f"{age / 3600:.1f}h"
 
 
+def _balanced_radar_view(df: pd.DataFrame, max_rows: int = 100) -> pd.DataFrame:
+    """Diversify the default board so one noisy longshot market cannot own the screen.
+
+    True arbs/middles keep their full priority. TD/first-scorer style price gaps stay
+    available, but receive a display penalty and a row cap. The raw board remains
+    available through the All signals view.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if "Market Group" not in x.columns:
+        x["Market Group"] = "Other markets"
+    x["_rank"] = pd.to_numeric(x.get("Score"), errors="coerce").fillna(0.0)
+    arbish = x["Type"].astype(str).str.startswith("TRUE ARB") | x["Type"].astype(str).isin(["ARB + MIDDLE", "MIDDLE"])
+    scorer = x["Market Group"].astype(str).eq("TD / scorer props") & ~arbish
+    # Longshot relative-payout gaps are useful, but should not crowd out yardage,
+    # receptions, game lines, or actual arbs.
+    x.loc[scorer, "_rank"] = x.loc[scorer, "_rank"] - 14.0
+    x = x.sort_values(["_rank", "Score"], ascending=[False, False], na_position="last")
+
+    kept = []
+    scorer_count = 0
+    per_market = {}
+    per_matchup = {}
+    for idx, row in x.iterrows():
+        group = str(row.get("Market Group", ""))
+        market = str(row.get("Market Key", row.get("Market", "")))
+        matchup = str(row.get("Matchup", ""))
+        is_arbish = str(row.get("Type", "")).startswith("TRUE ARB") or str(row.get("Type", "")) in {"ARB + MIDDLE", "MIDDLE"}
+        if group == "TD / scorer props" and not is_arbish and scorer_count >= 10:
+            continue
+        if not is_arbish and per_market.get(market, 0) >= 8:
+            continue
+        if not is_arbish and per_matchup.get(matchup, 0) >= 12:
+            continue
+        kept.append(idx)
+        per_market[market] = per_market.get(market, 0) + 1
+        per_matchup[matchup] = per_matchup.get(matchup, 0) + 1
+        if group == "TD / scorer props" and not is_arbish:
+            scorer_count += 1
+        if len(kept) >= int(max_rows):
+            break
+    return x.loc[kept].drop(columns=["_rank"], errors="ignore").reset_index(drop=True)
+
+
 def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
     st.markdown("---")
     st.subheader("🔎 Market Radar — automatic mispricing scanner")
     st.caption(
         "This is the Pikkit-style screen that does the scrolling for you. It scans only your selected books, then surfaces "
         "true arbs, middles, unusually good lines, exact-price outliers and sportsbook-vs-exchange disagreements. "
+        "The default Balanced feed prevents one longshot market (like first-TD scorers) from taking over the board. "
         "A flag is a market anomaly, not proof that a side will win."
     )
     with st.expander("What each flag means", expanded=False):
@@ -1541,6 +1587,16 @@ def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
         m4.metric("Line outliers", int((board["Type"] == "LINE OUTLIER").sum()))
         m5.metric("Watchlist hits", int(board.get("Watch", pd.Series(dtype=bool)).sum()))
 
+        mode_col, group_col = st.columns([1.2, 1.8])
+        board_mode = mode_col.selectbox(
+            "Board view",
+            ["Balanced", "Arbs & middles", "Game lines", "Core player props", "TD / scorer props", "All signals"],
+            index=0, key="radar_board_view",
+            help="Balanced is recommended. All signals shows the raw ranked output with no diversity cap."
+        )
+        available_groups = sorted(board.get("Market Group", pd.Series(["Other markets"])).fillna("Other markets").astype(str).unique())
+        filter_groups = group_col.multiselect("Market groups", available_groups, default=available_groups, key="radar_market_groups")
+
         f1, f2, f3, f4 = st.columns([1.3, 1.2, 1.2, 1.0])
         all_types = list(dict.fromkeys(board["Type"].astype(str).tolist()))
         filter_types = f1.multiselect("Opportunity types", all_types, default=all_types, key="radar_filter_types")
@@ -1552,8 +1608,19 @@ def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
         view = board[
             board["Type"].isin(filter_types)
             & board["Sport"].astype(str).isin(filter_sports)
+            & board.get("Market Group", pd.Series("Other markets", index=board.index)).astype(str).isin(filter_groups)
             & (pd.to_numeric(board["Score"], errors="coerce") >= float(min_score))
         ].copy()
+        if board_mode == "Arbs & middles":
+            view = view[view["Type"].astype(str).str.startswith("TRUE ARB") | view["Type"].astype(str).isin(["ARB + MIDDLE", "MIDDLE"])]
+        elif board_mode == "Game lines":
+            view = view[view.get("Market Group", "").astype(str).eq("Game lines")]
+        elif board_mode == "Core player props":
+            view = view[view.get("Market Group", "").astype(str).eq("Core player props")]
+        elif board_mode == "TD / scorer props":
+            view = view[view.get("Market Group", "").astype(str).eq("TD / scorer props")]
+        elif board_mode == "Balanced":
+            view = _balanced_radar_view(view, max_rows=100)
         if watch_only and "Watch" in view.columns:
             view = view[view["Watch"]]
         if search_text.strip():
@@ -1570,7 +1637,7 @@ def render_market_radar(api_key: str, selected_book_keys, bookmaker_csv: str):
             display["Signal"] = display["Type"].map(_radar_type_icon)
             display["Odds"] = display["Odds"].map(lambda x: fmt_odds(x) if pd.notna(x) else "—")
             display["Odds 2"] = display["Odds 2"].map(lambda x: fmt_odds(x) if pd.notna(x) else "")
-            cols = ["⭐", "Score", "Signal", "Sport", "Matchup", "Market", "Pick", "Book", "Odds", "Book 2", "Odds 2", "Edge", "Compare"]
+            cols = ["⭐", "Score", "Signal", "Sport", "Market Group", "Matchup", "Market", "Pick", "Book", "Odds", "Book 2", "Odds 2", "Edge", "Compare"]
             st.dataframe(
                 display[cols], width="stretch", hide_index=True,
                 column_config={
