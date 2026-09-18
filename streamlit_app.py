@@ -269,59 +269,188 @@ def grade_forward_test(snapshot: pd.DataFrame, schedule: pd.DataFrame) -> pd.Dat
     return out
 
 
+def _forward_model_summary(graded: pd.DataFrame, model_version: str) -> dict:
+    g = graded[graded["model_version"].astype(str).str.upper() == model_version.upper()].copy()
+    done = g[g["completed"]].copy()
+    nonpush = done[~done["ats_push"]].copy() if not done.empty else done
+    ats_w = int(nonpush["ats_correct"].sum()) if not nonpush.empty else 0
+    ats_l = int(len(nonpush) - ats_w) if not nonpush.empty else 0
+    ats_p = int(done["ats_push"].sum()) if not done.empty else 0
+    su_w = int(done["su_correct"].sum()) if not done.empty else 0
+    su_l = int(len(done) - su_w) if not done.empty else 0
+    market_mae = float(done["market_margin_abs_error"].mean()) if not done.empty else float("nan")
+    model_mae = float(done["model_margin_abs_error"].mean()) if not done.empty else float("nan")
+    return {
+        "model": model_version,
+        "logged": int(len(g)),
+        "completed": int(len(done)),
+        "ats_w": ats_w,
+        "ats_l": ats_l,
+        "ats_p": ats_p,
+        "ats_pct": (ats_w / len(nonpush)) if len(nonpush) else float("nan"),
+        "su_w": su_w,
+        "su_l": su_l,
+        "su_pct": (su_w / len(done)) if len(done) else float("nan"),
+        "model_mae": model_mae,
+        "market_mae": market_mae,
+        "mae_edge": (market_mae - model_mae) if not math.isnan(model_mae) and not math.isnan(market_mae) else float("nan"),
+        "brier": float(done["brier"].mean()) if not done.empty else float("nan"),
+        "log_loss": float(done["log_loss"].mean()) if not done.empty else float("nan"),
+        "first_week": int(pd.to_numeric(g["week"], errors="coerce").min()) if len(g) and pd.to_numeric(g["week"], errors="coerce").notna().any() else None,
+    }
+
+
+def _render_single_model_results(graded: pd.DataFrame, model_version: str) -> None:
+    g = graded[graded["model_version"].astype(str).str.upper() == model_version.upper()].copy()
+    if g.empty:
+        if model_version in {"V2.3", "V2.4"}:
+            st.info(
+                f"{model_version} has no official Week 1 rows because it was not persistently logged before every game. "
+                "Those games will not be backfilled after the results are known. Its 2026 record begins with the first saved pregame snapshot."
+            )
+        elif model_version == "V2.5":
+            st.info(
+                "V2.5 was created after Week 1, so it has no Week 1 forward-test record. Its official 2026 record begins with the first pregame snapshot saved after deployment."
+            )
+        else:
+            st.info(f"No official pregame {model_version} snapshots have been saved yet.")
+        return
+
+    s = _forward_model_summary(graded, model_version)
+    done = g[g["completed"]].copy()
+    pending = g[~g["completed"]].copy()
+
+    a, b, c, d = st.columns(4)
+    a.metric("Completed", f"{s['completed']}/{s['logged']}")
+    ats_record = f"{s['ats_w']}-{s['ats_l']}" + (f"-{s['ats_p']}" if s['ats_p'] else "")
+    b.metric("ATS direction", ats_record, None if math.isnan(s["ats_pct"]) else f"{s['ats_pct']:.1%}")
+    c.metric("Straight-up", f"{s['su_w']}-{s['su_l']}", None if math.isnan(s["su_pct"]) else f"{s['su_pct']:.1%}")
+    d.metric("Margin MAE", "—" if math.isnan(s["model_mae"]) else f"{s['model_mae']:.2f} pts")
+
+    a, b, c, d = st.columns(4)
+    a.metric("Market margin MAE", "—" if math.isnan(s["market_mae"]) else f"{s['market_mae']:.2f} pts")
+    b.metric("MAE vs market", "—" if math.isnan(s["mae_edge"]) else f"{s['mae_edge']:+.2f} pts", help="Positive means the model's margin MAE is lower than the closing/pregame market margin MAE on the same logged games.")
+    c.metric("ML Brier", "—" if math.isnan(s["brier"]) else f"{s['brier']:.4f}")
+    d.metric("ML log loss", "—" if math.isnan(s["log_loss"]) else f"{s['log_loss']:.4f}")
+
+    if not pending.empty:
+        st.caption("Pending: " + ", ".join((pending["away"] + " @ " + pending["home"]).tolist()))
+
+    if done.empty:
+        st.caption("Pregame predictions are logged, but none of those games have final scores yet.")
+        return
+
+    t = g.copy()
+    t["Matchup"] = t["away"] + " @ " + t["home"]
+    t["Week"] = pd.to_numeric(t["week"], errors="coerce").astype("Int64")
+    t["Final"] = t.apply(lambda r: f"{int(r['final_away_score'])}-{int(r['final_home_score'])}" if r["completed"] else "Pending", axis=1)
+    t["Model margin"] = t.apply(
+        lambda r: f"{r['home']} by {float(r['model_home_margin']):.1f}" if float(r['model_home_margin']) >= 0 else f"{r['away']} by {abs(float(r['model_home_margin'])):.1f}", axis=1
+    )
+    t["ATS pick"] = t.apply(lambda r: (r["home"] if r["model_home_ats_pick"] else r["away"]) + " ATS", axis=1)
+    t["ATS result"] = t.apply(lambda r: "Pending" if not r["completed"] else ("Push" if r["ats_push"] else ("W" if r["ats_correct"] else "L")), axis=1)
+    t["SU pick"] = t.apply(lambda r: r["home"] if r["model_home_su_pick"] else r["away"], axis=1)
+    t["SU result"] = t.apply(lambda r: "Pending" if not r["completed"] else ("W" if r["su_correct"] else "L"), axis=1)
+    t["Margin error"] = t["model_margin_abs_error"].map(lambda x: "—" if pd.isna(x) else f"{float(x):.1f}")
+    show = t[["Week", "Matchup", "Final", "Model margin", "home_spread", "ATS pick", "ATS result", "SU pick", "SU result", "Margin error"]].rename(
+        columns={"home_spread": "Pregame home spread"}
+    ).sort_values(["Week", "Matchup"])
+    st.dataframe(show, width="stretch", hide_index=True)
+
+
 def render_forward_test_panel(schedule: pd.DataFrame) -> None:
     snap = load_forward_test_snapshot()
     if snap.empty:
         return
-    graded = grade_forward_test(snap, schedule)
-    done = graded[graded["completed"]].copy()
-    if done.empty:
+    if "model_version" not in snap.columns:
+        snap["model_version"] = "V2.2"
+    snap["model_version"] = snap["model_version"].fillna("V2.2").astype(str).str.upper().str.replace(" ", "", regex=False)
+    snap["model_version"] = snap["model_version"].replace({"2.2": "V2.2", "2.3": "V2.3", "2.4": "V2.4", "2.5": "V2.5", "V22": "V2.2", "V23": "V2.3", "V24": "V2.4", "V25": "V2.5"})
+    graded_all = grade_forward_test(snap, schedule)
+    if graded_all.empty:
         return
 
-    nonpush = done[~done["ats_push"]]
-    ats_w = int(nonpush["ats_correct"].sum())
-    ats_l = int(len(nonpush) - ats_w)
-    ats_p = int(done["ats_push"].sum())
-    su_w = int(done["su_correct"].sum())
-    su_l = int(len(done) - su_w)
-
-    st.subheader("2026 Forward-Test Results")
+    st.subheader("📊 2026 Model Results")
     st.caption(
-        "These are frozen pregame V2.2 predictions saved from the September 12 screenshots. "
-        "The Wednesday NE–SEA and Thursday SF–LA games are excluded because the forward-test app was deployed after they were played. "
-        "V2.3 and V2.4 were not persistently logged for every Week 1 game, so they are not backfilled after the fact."
-    )
-    a, b, c, d = st.columns(4)
-    a.metric("Completed test games", f"{len(done)}/{len(graded)}")
-    a2 = f"{ats_w}-{ats_l}" + (f"-{ats_p}" if ats_p else "")
-    b.metric("V2.2 ATS direction", a2, f"{(ats_w / max(1, len(nonpush))):.1%}")
-    c.metric("Straight-up direction", f"{su_w}-{su_l}", f"{(su_w / max(1, len(done))):.1%}")
-    d.metric("V2.2 margin MAE", f"{done['model_margin_abs_error'].mean():.2f} pts")
-
-    a, b, c, d = st.columns(4)
-    a.metric("Market-line margin MAE", f"{done['market_margin_abs_error'].mean():.2f} pts")
-    b.metric("V2.2 ML Brier", f"{done['brier'].mean():.4f}")
-    c.metric("V2.2 ML log loss", f"{done['log_loss'].mean():.4f}")
-    pending = graded[~graded["completed"]]
-    d.metric("Pending", ", ".join((pending["away"] + " @ " + pending["home"]).tolist()) if len(pending) else "None")
-
-    st.info(
-        "Do not retrain the estimator weights after one week. Week 1 game data should become Week 2 inputs, while V2.2/V2.3/V2.4 stay frozen so the 2026 forward test remains clean."
+        "Official forward-test dashboard for every side model. Only predictions saved before kickoff count. "
+        "V2.2 has the preserved Week 1 screenshot set; V2.3/V2.4 were not fully logged in Week 1 and are not backfilled; V2.5 was created after Week 1."
     )
 
-    with st.expander("Week 1 game-by-game forward-test grading"):
-        t = graded.copy()
-        t["Matchup"] = t["away"] + " @ " + t["home"]
-        t["Final"] = t.apply(lambda r: f"{int(r['final_away_score'])}-{int(r['final_home_score'])}" if r["completed"] else "Pending", axis=1)
-        t["ATS pick"] = t.apply(lambda r: (r["home"] if r["model_home_ats_pick"] else r["away"]) + " ATS", axis=1)
-        t["ATS result"] = t.apply(lambda r: "Pending" if not r["completed"] else ("Push" if r["ats_push"] else ("W" if r["ats_correct"] else "L")), axis=1)
-        t["SU pick"] = t.apply(lambda r: r["home"] if r["model_home_su_pick"] else r["away"], axis=1)
-        t["SU result"] = t.apply(lambda r: "Pending" if not r["completed"] else ("W" if r["su_correct"] else "L"), axis=1)
-        show = t[["Matchup", "Final", "model_home_margin", "home_spread", "ATS pick", "ATS result", "SU pick", "SU result"]].rename(
-            columns={"model_home_margin": "V2.2 home margin", "home_spread": "Pregame home spread"}
+    available_weeks = sorted({int(x) for x in pd.to_numeric(graded_all.get("week"), errors="coerce").dropna().tolist()})
+    week_choice = st.selectbox(
+        "Results range",
+        ["All weeks"] + [f"Week {w}" for w in available_weeks],
+        key="forward_results_week_filter",
+    )
+    graded = graded_all
+    if week_choice != "All weeks":
+        wanted = int(week_choice.split()[-1])
+        graded = graded_all[pd.to_numeric(graded_all["week"], errors="coerce") == wanted].copy()
+
+    versions = ["V2.2", "V2.3", "V2.4", "V2.5"]
+    summaries = [_forward_model_summary(graded, v) for v in versions]
+    summary_rows = []
+    for s in summaries:
+        summary_rows.append({
+            "Model": s["model"],
+            "Logged": s["logged"],
+            "Completed": s["completed"],
+            "ATS": "—" if s["logged"] == 0 else f"{s['ats_w']}-{s['ats_l']}" + (f"-{s['ats_p']}" if s['ats_p'] else ""),
+            "ATS %": "—" if math.isnan(s["ats_pct"]) else f"{s['ats_pct']:.1%}",
+            "SU": "—" if s["logged"] == 0 else f"{s['su_w']}-{s['su_l']}",
+            "SU %": "—" if math.isnan(s["su_pct"]) else f"{s['su_pct']:.1%}",
+            "Margin MAE": "—" if math.isnan(s["model_mae"]) else f"{s['model_mae']:.2f}",
+            "Market MAE": "—" if math.isnan(s["market_mae"]) else f"{s['market_mae']:.2f}",
+            "MAE vs market": "—" if math.isnan(s["mae_edge"]) else f"{s['mae_edge']:+.2f}",
+            "Brier": "—" if math.isnan(s["brier"]) else f"{s['brier']:.4f}",
+            "Log loss": "—" if math.isnan(s["log_loss"]) else f"{s['log_loss']:.4f}",
+        })
+    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+    st.caption("MAE vs market = market margin MAE minus model margin MAE. Positive is better for the model. ATS direction uses the side with model cover probability above 50%; it is not the same as ROI at offered prices.")
+
+    all_tab, v22_tab, v23_tab, v24_tab, v25_tab = st.tabs(["Overview", "V2.2", "V2.3", "V2.4", "V2.5"])
+    with all_tab:
+        completed = graded[graded["completed"]].copy()
+        if completed.empty:
+            st.info("No completed officially logged games in this range yet.")
+        else:
+            rows = []
+            for v in versions:
+                s = _forward_model_summary(graded, v)
+                if s["logged"]:
+                    rows.append({
+                        "Model": v,
+                        "Games": s["completed"],
+                        "ATS %": None if math.isnan(s["ats_pct"]) else s["ats_pct"],
+                        "SU %": None if math.isnan(s["su_pct"]) else s["su_pct"],
+                        "Margin MAE": None if math.isnan(s["model_mae"]) else s["model_mae"],
+                        "Brier": None if math.isnan(s["brier"]) else s["brier"],
+                        "Log loss": None if math.isnan(s["log_loss"]) else s["log_loss"],
+                    })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.info(
+            "Do not backfill model predictions after a game is played. New versions earn a forward-test record only from predictions that were actually saved before kickoff."
         )
-        st.dataframe(show, width="stretch", hide_index=True)
-        st.caption("ATS direction grades the side whose model cover probability was above 50%. This is not the same thing as ROI on every positive-EV price.")
+    with v22_tab:
+        _render_single_model_results(graded, "V2.2")
+    with v23_tab:
+        _render_single_model_results(graded, "V2.3")
+    with v24_tab:
+        _render_single_model_results(graded, "V2.4")
+    with v25_tab:
+        _render_single_model_results(graded, "V2.5")
+
+    with st.expander("Forward-test logging rules"):
+        st.markdown(
+            """
+- **V2.2 Week 1:** official preserved pregame screenshots only.
+- **V2.3 / V2.4 Week 1:** not scored because a complete pregame set was not persistently saved.
+- **V2.5 Week 1:** not eligible because V2.5 did not exist yet.
+- **Going forward:** save each model's prediction before kickoff using the same market line snapshot; never create a missing prediction after the result is known.
+- Models may consume newly completed games as live inputs without retraining their frozen estimator weights.
+            """
+        )
 
 # -----------------------------
 # Network data loaders
