@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -209,15 +210,162 @@ def load_model_files():
 
 COEF, HOLDOUT, HISTORICAL = load_model_files()
 
-@st.cache_data(show_spinner=False)
+FORWARD_TEST_BASE_COLUMNS = [
+    "game_id", "season", "week", "away", "home", "model_version",
+    "model_home_margin", "home_spread", "p_home_win", "p_home_cover",
+    "screenshot", "verified_away_score", "verified_home_score",
+    "snapshot_date", "snapshot_source",
+    "saved_at_utc", "kickoff_utc", "market_source",
+    "market_total", "home_spread_odds", "away_spread_odds", "home_ml", "away_ml",
+    "eligible_coverage", "referee_adjustment_points",
+]
+
+
+def _forward_store_config() -> dict:
+    """Read durable forward-test storage settings from Streamlit Secrets."""
+    cfg = {}
+    try:
+        raw = st.secrets.get("forward_test", {})
+        cfg = dict(raw) if raw else {}
+    except Exception:
+        cfg = {}
+    token = str(cfg.get("github_token", "") or "").strip()
+    if not token:
+        try:
+            token = str(st.secrets.get("FORWARD_TEST_GITHUB_TOKEN", "") or "").strip()
+        except Exception:
+            token = ""
+    return {
+        "github_token": token,
+        "repo": str(cfg.get("repo", "kd234140-commits/NFL-Totals-Lab") or "kd234140-commits/NFL-Totals-Lab").strip(),
+        "branch": str(cfg.get("branch", "main") or "main").strip(),
+        "path": str(cfg.get("path", FORWARD_TEST_FILE.name) or FORWARD_TEST_FILE.name).strip(),
+    }
+
+
+def _coerce_forward_snapshot(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=FORWARD_TEST_BASE_COLUMNS)
+    out = df.copy()
+    for col in FORWARD_TEST_BASE_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    for col in [
+        "season", "week", "model_home_margin", "home_spread", "p_home_win",
+        "p_home_cover", "verified_away_score", "verified_home_score",
+        "market_total", "home_spread_odds", "away_spread_odds", "home_ml",
+        "away_ml", "eligible_coverage", "referee_adjustment_points",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def _github_forward_file(config: dict) -> tuple[pd.DataFrame, str | None]:
+    token = config.get("github_token")
+    repo = config.get("repo")
+    if not token or not repo:
+        raise RuntimeError("Durable GitHub forward-test storage is not configured.")
+    branch = config.get("branch") or "main"
+    path = config.get("path") or FORWARD_TEST_FILE.name
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    r = requests.get(url, headers=headers, params={"ref": branch}, timeout=30)
+    if r.status_code == 404:
+        return pd.DataFrame(columns=FORWARD_TEST_BASE_COLUMNS), None
+    if r.status_code >= 400:
+        raise RuntimeError(f"GitHub forward-test read failed ({r.status_code}): {r.text[:300]}")
+    payload = r.json()
+    encoded = str(payload.get("content", "")).replace("\n", "")
+    raw = base64.b64decode(encoded).decode("utf-8") if encoded else ""
+    df = pd.read_csv(io.StringIO(raw)) if raw.strip() else pd.DataFrame(columns=FORWARD_TEST_BASE_COLUMNS)
+    return _coerce_forward_snapshot(df), payload.get("sha")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def load_forward_test_snapshot() -> pd.DataFrame:
+    config = _forward_store_config()
+    if config.get("github_token") and config.get("repo"):
+        try:
+            df, _ = _github_forward_file(config)
+            return _coerce_forward_snapshot(df)
+        except Exception:
+            pass
     if not FORWARD_TEST_FILE.exists():
-        return pd.DataFrame()
-    df = pd.read_csv(FORWARD_TEST_FILE)
-    for c in ["model_home_margin", "home_spread", "p_home_win", "p_home_cover", "verified_away_score", "verified_home_score"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+        return pd.DataFrame(columns=FORWARD_TEST_BASE_COLUMNS)
+    return _coerce_forward_snapshot(pd.read_csv(FORWARD_TEST_FILE))
+
+
+def append_forward_test_rows(rows: pd.DataFrame) -> dict:
+    """Append-only official forward-test storage; existing game/model rows are never overwritten."""
+    incoming = _coerce_forward_snapshot(rows)
+    if incoming.empty:
+        return {"added": 0, "existing": 0, "durable": False, "message": "No prediction rows were produced."}
+    incoming = incoming.drop_duplicates(["game_id", "model_version"], keep="first").copy()
+    config = _forward_store_config()
+    use_github = bool(config.get("github_token") and config.get("repo"))
+
+    def _merge(current: pd.DataFrame):
+        current = _coerce_forward_snapshot(current)
+        existing_keys = set(zip(current["game_id"].astype(str), current["model_version"].astype(str)))
+        mask = [
+            (str(r.game_id), str(r.model_version)) not in existing_keys
+            for r in incoming[["game_id", "model_version"]].itertuples(index=False)
+        ]
+        fresh = incoming.loc[mask].copy()
+        combined = pd.concat([current, fresh], ignore_index=True, sort=False) if len(fresh) else current
+        return combined, fresh
+
+    if use_github:
+        for attempt in range(2):
+            current, sha = _github_forward_file(config)
+            combined, fresh = _merge(current)
+            if fresh.empty:
+                return {
+                    "added": 0, "existing": int(len(incoming)), "durable": True,
+                    "message": "Every available game/model prediction was already logged."
+                }
+            csv_text = combined.to_csv(index=False)
+            url = f"https://api.github.com/repos/{config['repo']}/contents/{config['path']}"
+            headers = {
+                "Authorization": f"Bearer {config['github_token']}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            payload = {
+                "message": f"Log NFL 2026 forward-test snapshot ({len(fresh)} rows)",
+                "content": base64.b64encode(csv_text.encode("utf-8")).decode("ascii"),
+                "branch": config.get("branch") or "main",
+            }
+            if sha:
+                payload["sha"] = sha
+            r = requests.put(url, headers=headers, json=payload, timeout=30)
+            if r.status_code in {200, 201}:
+                try:
+                    combined.to_csv(FORWARD_TEST_FILE, index=False)
+                except Exception:
+                    pass
+                load_forward_test_snapshot.clear()
+                return {
+                    "added": int(len(fresh)),
+                    "existing": int(len(incoming) - len(fresh)),
+                    "durable": True,
+                    "message": f"Saved {len(fresh)} new official pregame prediction rows to GitHub."
+                }
+            if r.status_code == 409 and attempt == 0:
+                continue
+            raise RuntimeError(f"GitHub forward-test write failed ({r.status_code}): {r.text[:400]}")
+
+    return {
+        "added": 0,
+        "existing": 0,
+        "durable": False,
+        "message": "Durable logging is not configured. Add the forward_test GitHub token in Streamlit Secrets first."
+    }
 
 
 def grade_forward_test(snapshot: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
@@ -359,6 +507,9 @@ def _render_single_model_results(graded: pd.DataFrame, model_version: str) -> No
 
 
 def render_forward_test_panel(schedule: pd.DataFrame) -> None:
+    flash = st.session_state.pop("forward_snapshot_flash", None)
+    if flash:
+        st.success(str(flash))
     snap = load_forward_test_snapshot()
     if snap.empty:
         return
@@ -1198,6 +1349,98 @@ def _weekly_weather_inputs(game_row, home_team):
         except Exception:
             pass
     return temp, wind, 0.0, label
+
+
+def _forward_snapshot_dome(game_row, home_team: str) -> float:
+    roof_type = "fixed" if home_team in FIXED_ROOF else "retractable" if home_team in RETRACTABLE_ROOF else "outdoor"
+    schedule_roof = str(game_row.get("roof") or "").lower()
+    if roof_type == "fixed":
+        return 1.0
+    if roof_type == "retractable" and schedule_roof in {"closed", "dome"}:
+        return 1.0
+    return 0.0
+
+
+def _forward_snapshot_row(game_row, model_version: str, result: dict, market: dict, saved_at: datetime) -> dict:
+    kickoff = schedule_kickoff_utc(game_row)
+    return {
+        "game_id": str(game_row.get("game_id")),
+        "season": int(game_row.get("season")),
+        "week": int(game_row.get("week")),
+        "away": str(game_row.get("away_team")),
+        "home": str(game_row.get("home_team")),
+        "model_version": model_version,
+        "model_home_margin": float(result["predicted_margin"]),
+        "home_spread": float(market["home_spread"]),
+        "p_home_win": float(result["p_home_win"]),
+        "p_home_cover": float(result["p_home_cover"]),
+        "screenshot": "",
+        "verified_away_score": pd.NA,
+        "verified_home_score": pd.NA,
+        "snapshot_date": saved_at.date().isoformat(),
+        "snapshot_source": "Automatic app pregame snapshot",
+        "saved_at_utc": saved_at.isoformat(),
+        "kickoff_utc": kickoff.isoformat(),
+        "market_source": str(market.get("book") or "unknown"),
+        "market_total": float(market["total"]),
+        "home_spread_odds": float(market["home_spread_odds"]),
+        "away_spread_odds": float(market["away_spread_odds"]),
+        "home_ml": float(market["home_ml"]),
+        "away_ml": float(market["away_ml"]),
+        "eligible_coverage": float(result.get("eligible_coverage", result.get("coverage", float("nan")))),
+        "referee_adjustment_points": float(result.get("referee_adjustment_points", 0.0) or 0.0),
+    }
+
+
+def build_forward_test_week_snapshot(*, schedule, week_games, odds_events, prev_pbp, cur_pbp, root) -> tuple[pd.DataFrame, list[str]]:
+    """Run V2.2-V2.5 for every not-yet-started game in the selected week."""
+    saved_at = datetime.now(timezone.utc)
+    rows = []
+    skipped = []
+    builders = [
+        ("V2.2", build_side_prediction),
+        ("V2.3", build_side_prediction_v23),
+        ("V2.4", build_side_prediction_v24),
+        ("V2.5", build_side_prediction_v25),
+    ]
+
+    for _, g in week_games.sort_values(["gameday", "gametime", "game_id"]).iterrows():
+        away_t, home_t = str(g["away_team"]), str(g["home_team"])
+        matchup = f"{away_t} @ {home_t}"
+        kickoff = schedule_kickoff_utc(g)
+        if saved_at >= kickoff:
+            skipped.append(f"{matchup}: kickoff already passed; no backfill allowed")
+            continue
+
+        live_book_rows = book_market_rows(match_odds_event(odds_events, away_t, home_t)) if odds_events else []
+        market = _weekly_reference_market(live_book_rows, g)
+        required = ["total", "over", "under", "home_spread", "home_spread_odds", "away_spread_odds", "home_ml", "away_ml"]
+        if any(market.get(k) is None for k in required):
+            skipped.append(f"{matchup}: incomplete market snapshot")
+            continue
+
+        dome_i = _forward_snapshot_dome(g, home_t)
+        for model_version, builder in builders:
+            if builder is None:
+                skipped.append(f"{matchup} {model_version}: model module unavailable")
+                continue
+            try:
+                result = builder(
+                    root=root, schedule=schedule, game=g, prev_pbp=prev_pbp, cur_pbp=cur_pbp,
+                    home=home_t, away=away_t, season=int(g["season"]), week=int(g["week"]),
+                    market_total=float(market["total"]), over_odds=float(market["over"]), under_odds=float(market["under"]),
+                    home_spread=float(market["home_spread"]),
+                    home_spread_odds=float(market["home_spread_odds"]), away_spread_odds=float(market["away_spread_odds"]),
+                    home_ml=float(market["home_ml"]), away_ml=float(market["away_ml"]), dome=float(dome_i),
+                )
+                if result:
+                    rows.append(_forward_snapshot_row(g, model_version, result, market, saved_at))
+                else:
+                    skipped.append(f"{matchup} {model_version}: no prediction returned")
+            except Exception as exc:
+                skipped.append(f"{matchup} {model_version}: {exc}")
+
+    return pd.DataFrame(rows), skipped
 
 
 def build_weekly_favorites_board(
@@ -2285,6 +2528,91 @@ if board_key in st.session_state:
     render_weekly_favorites(st.session_state[board_key], week)
 else:
     st.info("Click the button above after odds have loaded. The scan checks every game in the selected week and keeps the top three in each market.")
+
+# -----------------------------
+# Official prospective snapshot logger
+# -----------------------------
+st.markdown("---")
+st.subheader("🔒 Official 2026 forward-test snapshot")
+st.caption(
+    "Saves V2.2, V2.3, V2.4 and V2.5 predictions BEFORE kickoff. "
+    "The key is game_id + model_version, so an existing official row is never overwritten."
+)
+store_cfg = _forward_store_config()
+durable_store = bool(store_cfg.get("github_token") and store_cfg.get("repo"))
+if durable_store:
+    st.success(
+        f"Durable logging is ON → {store_cfg['repo']} / {store_cfg.get('path') or FORWARD_TEST_FILE.name}. "
+        "The token is read from Streamlit Secrets and is never displayed."
+    )
+else:
+    st.warning(
+        "Durable logging is not configured yet, so the official save button is disabled. "
+        "In Streamlit Cloud → App settings → Secrets, add:\n\n"
+        "[forward_test]\n"
+        'github_token = "YOUR_FINE_GRAINED_GITHUB_TOKEN"\n'
+        'repo = "kd234140-commits/NFL-Totals-Lab"\n'
+        'branch = "main"\n'
+        'path = "v2_2026_forward_test_snapshot.csv"'
+    )
+
+existing_forward = load_forward_test_snapshot()
+week_existing = existing_forward[
+    (pd.to_numeric(existing_forward.get("season"), errors="coerce") == season)
+    & (pd.to_numeric(existing_forward.get("week"), errors="coerce") == week)
+].copy() if not existing_forward.empty else pd.DataFrame()
+expected_versions = ["V2.2", "V2.3", "V2.4", "V2.5"]
+logged_keys = set(
+    zip(
+        week_existing.get("game_id", pd.Series(dtype=str)).astype(str),
+        week_existing.get("model_version", pd.Series(dtype=str)).astype(str),
+    )
+) if not week_existing.empty else set()
+now_utc = datetime.now(timezone.utc)
+future_games = [
+    str(g.get("game_id"))
+    for _, g in week_games.iterrows()
+    if now_utc < schedule_kickoff_utc(g)
+]
+expected_keys = {(gid, mv) for gid in future_games for mv in expected_versions}
+logged_future = len(expected_keys & logged_keys)
+
+a, b, c = st.columns(3)
+a.metric("Pregame games still eligible", len(future_games))
+b.metric("Eligible model rows already logged", f"{logged_future}/{len(expected_keys)}" if expected_keys else "0/0")
+c.metric("Storage", "Durable GitHub" if durable_store else "Not configured")
+
+if st.button(
+    f"Save official Week {week} pregame snapshot for V2.2–V2.5",
+    type="primary",
+    key=f"save_forward_snapshot_{season}_{week}",
+    disabled=(len(future_games) == 0 or not durable_store),
+):
+    try:
+        with st.spinner(f"Running V2.2–V2.5 for every Week {week} game that has not kicked off…"):
+            snapshot_rows, snapshot_skips = build_forward_test_week_snapshot(
+                schedule=schedule, week_games=week_games, odds_events=odds_events,
+                prev_pbp=prev_pbp, cur_pbp=cur_pbp, root=ROOT,
+            )
+            save_result = append_forward_test_rows(snapshot_rows)
+        if save_result.get("durable") and save_result.get("added", 0) > 0:
+            st.session_state["forward_snapshot_flash"] = save_result.get("message")
+            st.rerun()
+        elif save_result.get("durable"):
+            st.info(save_result.get("message"))
+        else:
+            st.warning(save_result.get("message"))
+        if snapshot_skips:
+            with st.expander(f"Skipped / unavailable snapshot rows ({len(snapshot_skips)})"):
+                for item in snapshot_skips:
+                    st.write("•", item)
+    except Exception as exc:
+        st.error(f"Forward-test snapshot failed: {exc}")
+
+st.caption(
+    "After rows are saved, the 2026 Model Results table grades them automatically from final scores. "
+    "Past-kickoff games are rejected, so missing Weeks 2–3 predictions are not backfilled after results are known."
+)
 
 st.markdown("---")
 st.subheader("💰 NFL detailed line shop, player props & arbitrage")
